@@ -517,9 +517,51 @@ export function wrapUntrustedForPrompt(label: string, content: string): string {
 }
 
 // ============================================================================
-// SSRF Protection: IP Ranges, DNS Resolution, Redirect Revalidation & Byte Cap
-// (BUG-04, BUG-10, BUG-11)
+// SSRF Protection: Scoped Network Policies, IPv4/IPv6 Loopback Normalization,
+// DNS Resolution & Address Pinning, Redirect Isolation & Byte Cap
+// (BUG-04, BUG-10, BUG-11 + Centralized Local AI Provider Policy)
 // ============================================================================
+
+export type NetworkPolicyScope =
+  | 'public_only'
+  | 'ai_provider_loopback_or_public'
+  | 'ai_provider_public_only';
+
+export interface NetworkAccessPolicy {
+  scope: NetworkPolicyScope;
+  /** Permits ONLY explicitly configured loopback hosts (localhost, 127.0.0.0/8, ::1, ::ffff:127.0.0.0/104). Never permits private LAN or cloud metadata. */
+  allowExplicitLoopback: boolean;
+  /** Optional hostname allowlist for public targets */
+  allowedHosts?: string[];
+  /** Max redirect hops permitted */
+  maxRedirects?: number;
+  /**
+   * When true (default), redirects cannot cross security boundaries:
+   * - Loopback targets may redirect ONLY within the exact same loopback origin (same protocol, loopback host, and port).
+   * - Public targets may redirect ONLY to public targets (NEVER to loopback, private LAN, or metadata).
+   */
+  enforceRedirectBoundary?: boolean;
+  policyName: string;
+}
+
+export const PUBLIC_ONLY_NETWORK_POLICY: NetworkAccessPolicy = Object.freeze({
+  scope: 'public_only',
+  allowExplicitLoopback: false,
+  enforceRedirectBoundary: true,
+  policyName: 'default:public_only',
+});
+
+export type EndpointPolicyErrorCode = 'invalid_endpoint' | 'blocked_endpoint' | 'dns_error';
+
+export class EndpointPolicyError extends Error {
+  public readonly code: EndpointPolicyErrorCode;
+
+  constructor(code: EndpointPolicyErrorCode, message: string) {
+    super(message);
+    this.name = 'EndpointPolicyError';
+    this.code = code;
+  }
+}
 
 function expandIpv6ToWords(ip: string): number[] | null {
   const bare = ip.toLowerCase().replace(/^\[|\]$/g, '').split('%')[0];
@@ -549,19 +591,47 @@ function expandIpv6ToWords(ip: string): number[] | null {
   return words;
 }
 
+export function normalizeHostname(hostOrIp: string): string {
+  const trimmed = hostOrIp.trim().toLowerCase();
+  const unbracketed = trimmed.replace(/^\[|\]$/g, '');
+  if (net.isIP(unbracketed)) {
+    return unbracketed;
+  }
+  // Normalize single trailing DNS root dot (e.g. "localhost." -> "localhost")
+  return unbracketed.endsWith('.') ? unbracketed.slice(0, -1) : unbracketed;
+}
+
 export function isLoopbackIp(ip: string): boolean {
-  const bare = ip.toLowerCase().replace(/^\[|\]$/g, '').split('%')[0];
+  const raw = ip.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (raw.includes('%')) return false;
+  const bare = normalizeHostname(raw);
   if (bare === 'localhost') return true;
   if (net.isIPv4(bare)) {
     return bare.split('.').map(Number)[0] === 127;
   }
   const words = expandIpv6ToWords(bare);
   if (!words) return false;
-  // ::1
+  // ::1 (IPv6 loopback)
   if (words.slice(0, 7).every((w) => w === 0) && words[7] === 1) return true;
-  // ::ffff:127.0.0.0/104
+  // ::ffff:127.0.0.0/104 (IPv4-mapped IPv6 loopback)
   if (words.slice(0, 5).every((w) => w === 0) && words[5] === 0xffff && (words[6] >> 8) === 127) return true;
   return false;
+}
+
+/**
+ * Returns true ONLY for explicit loopback host identifiers in a URL:
+ * - exact hostname "localhost" (or "localhost.")
+ * - IPv4 loopback literal 127.0.0.0/8
+ * - IPv6 loopback literal ::1 or expanded 0:0:0:0:0:0:0:1
+ * - IPv4-mapped IPv6 loopback literal ::ffff:127.0.0.0/104
+ * Explicitly returns false for 0.0.0.0, ::, private LAN IPs, link-local/metadata IPs, and public hostnames.
+ */
+export function isExplicitLoopbackHost(hostname: string): boolean {
+  if (!hostname) return false;
+  const raw = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  // Reject IPv6 zone identifiers (e.g. fe80::1%eth0 or ::1%lo)
+  if (raw.includes('%')) return false;
+  return isLoopbackIp(raw);
 }
 
 function isPrivateIpv4Octets(a: number, b: number, c: number): boolean {
@@ -582,14 +652,17 @@ function isPrivateIpv4Octets(a: number, b: number, c: number): boolean {
 }
 
 export function isPrivateOrRestrictedIp(hostOrIp: string): boolean {
-  const lower = hostOrIp.trim().toLowerCase();
+  const lower = normalizeHostname(hostOrIp);
   if (
     !lower ||
     lower === 'localhost' ||
     lower.endsWith('.localhost') ||
     lower.endsWith('.local') ||
     lower.endsWith('.internal') ||
-    lower.endsWith('.arpa')
+    lower.endsWith('.arpa') ||
+    lower === 'metadata' ||
+    lower === 'metadata.google.internal' ||
+    lower === 'instance-data'
   ) {
     return true;
   }
@@ -648,44 +721,99 @@ export function isPrivateOrRestrictedIp(hostOrIp: string): boolean {
   return false;
 }
 
+function resolveEffectiveNetworkPolicy(options: {
+  policy?: NetworkAccessPolicy;
+  allowLocalOllama?: boolean;
+  allowedHosts?: string[];
+}): NetworkAccessPolicy {
+  if (options.policy) {
+    return {
+      ...options.policy,
+      allowedHosts: options.allowedHosts ?? options.policy.allowedHosts,
+      enforceRedirectBoundary: options.policy.enforceRedirectBoundary ?? true,
+    };
+  }
+  if (options.allowLocalOllama) {
+    return {
+      scope: 'ai_provider_loopback_or_public',
+      allowExplicitLoopback: true,
+      allowedHosts: options.allowedHosts,
+      enforceRedirectBoundary: true,
+      policyName: 'legacy:allowLocalOllama',
+    };
+  }
+  return {
+    ...PUBLIC_ONLY_NETWORK_POLICY,
+    allowedHosts: options.allowedHosts,
+  };
+}
+
 export function validateExternalUrl(
   rawUrl: string,
-  options: { allowLocalOllama?: boolean; allowedHosts?: string[] } = {},
+  options: { policy?: NetworkAccessPolicy; allowLocalOllama?: boolean; allowedHosts?: string[] } = {},
 ): URL {
+  const trimmed = String(rawUrl || '').trim();
   let parsed: URL;
   try {
-    parsed = new URL(rawUrl);
+    parsed = new URL(trimmed);
   } catch {
-    throw new Error('Invalid URL format');
+    throw new EndpointPolicyError('invalid_endpoint', 'Invalid URL format');
   }
   if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
-    throw new Error('Only http and https URLs are permitted');
+    throw new EndpointPolicyError('invalid_endpoint', 'Only http and https URLs are permitted');
   }
   if (parsed.username || parsed.password) {
-    throw new Error('Embedded URL credentials are not permitted');
+    throw new EndpointPolicyError('invalid_endpoint', 'Embedded URL credentials are not permitted');
+  }
+  if (!parsed.hostname) {
+    throw new EndpointPolicyError('invalid_endpoint', 'Endpoint URL must include a hostname');
+  }
+  // Reject IPv6 zone identifiers (e.g. [%25eth0])
+  if (parsed.hostname.includes('%')) {
+    throw new EndpointPolicyError('blocked_endpoint', 'IPv6 zone identifiers are not permitted in endpoint URLs');
   }
 
-  const host = parsed.hostname.toLowerCase();
-  const isLoopback = isLoopbackIp(host);
+  const effectivePolicy = resolveEffectiveNetworkPolicy(options);
+  const rawHost = parsed.hostname.toLowerCase();
+  const normalizedHost = normalizeHostname(rawHost);
+  const isLoopback = isExplicitLoopbackHost(rawHost);
 
-  if (options.allowLocalOllama && isLoopback) {
-    return parsed;
+  if (isLoopback) {
+    if (effectivePolicy.allowExplicitLoopback && effectivePolicy.scope === 'ai_provider_loopback_or_public') {
+      return parsed;
+    }
+    throw new EndpointPolicyError(
+      'blocked_endpoint',
+      `Blocked loopback endpoint (${normalizedHost}): policy "${effectivePolicy.policyName}" does not permit loopback access`,
+    );
   }
 
-  if (isPrivateOrRestrictedIp(host)) {
-    throw new Error(`Blocked restricted internal or private network host: ${host}`);
+  if (isPrivateOrRestrictedIp(normalizedHost)) {
+    throw new EndpointPolicyError(
+      'blocked_endpoint',
+      `Blocked restricted internal or private network host: ${normalizedHost}`,
+    );
   }
 
-  if (options.allowedHosts && options.allowedHosts.length > 0) {
-    const ok = options.allowedHosts.some(
-      (allowed) => host === allowed.toLowerCase() || host.endsWith('.' + allowed.toLowerCase()),
+  if (effectivePolicy.allowedHosts && effectivePolicy.allowedHosts.length > 0) {
+    const ok = effectivePolicy.allowedHosts.some(
+      (allowed) =>
+        normalizedHost === allowed.toLowerCase() || normalizedHost.endsWith('.' + allowed.toLowerCase()),
     );
     if (!ok) {
-      throw new Error(`Host ${host} is not in the permitted allowlist`);
+      throw new EndpointPolicyError(
+        'blocked_endpoint',
+        `Host ${normalizedHost} is not in the permitted allowlist`,
+      );
     }
   }
 
   return parsed;
+}
+
+export interface ValidatedPinnedAddress {
+  address: string;
+  family: 4 | 6;
 }
 
 export interface ResolvedExternalTarget {
@@ -693,30 +821,47 @@ export interface ResolvedExternalTarget {
   pinnedAddress: string;
   pinnedFamily: 4 | 6;
   allAddresses: string[];
+  validatedAddresses: ValidatedPinnedAddress[];
+  isLoopbackTarget: boolean;
 }
 
 export async function validateAndResolveExternalUrl(
   rawUrl: string,
   options: {
+    policy?: NetworkAccessPolicy;
     allowLocalOllama?: boolean;
     allowedHosts?: string[];
     customLookup?: (hostname: string) => Promise<Array<{ address: string; family: number }>>;
   } = {},
 ): Promise<ResolvedExternalTarget> {
-  const parsed = validateExternalUrl(rawUrl, options);
-  const bareHost = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const effectivePolicy = resolveEffectiveNetworkPolicy(options);
+  const parsed = validateExternalUrl(rawUrl, { policy: effectivePolicy });
+  const rawBareHost = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const normalizedHost = normalizeHostname(rawBareHost);
+  const isExplicitLoopback = isExplicitLoopbackHost(rawBareHost);
+  const loopbackAuthorized =
+    isExplicitLoopback &&
+    effectivePolicy.allowExplicitLoopback &&
+    effectivePolicy.scope === 'ai_provider_loopback_or_public';
 
-  // If literal IP, already validated by validateExternalUrl
-  const ipFamily = net.isIP(bareHost);
+  // Literal IPv4 or IPv6 address (already validated by validateExternalUrl, double-checked here fail-closed)
+  const ipFamily = net.isIP(rawBareHost);
   if (ipFamily === 4 || ipFamily === 6) {
-    if (!options.allowLocalOllama && isPrivateOrRestrictedIp(bareHost)) {
-      throw new Error(`Blocked restricted IP address: ${bareHost}`);
+    if (isLoopbackIp(rawBareHost)) {
+      if (!loopbackAuthorized) {
+        throw new EndpointPolicyError('blocked_endpoint', `Blocked restricted loopback IP address: ${rawBareHost}`);
+      }
+    } else if (isPrivateOrRestrictedIp(rawBareHost)) {
+      throw new EndpointPolicyError('blocked_endpoint', `Blocked restricted IP address: ${rawBareHost}`);
     }
+    const family: 4 | 6 = ipFamily === 6 ? 6 : 4;
     return {
       url: parsed,
-      pinnedAddress: bareHost,
-      pinnedFamily: ipFamily as 4 | 6,
-      allAddresses: [bareHost],
+      pinnedAddress: rawBareHost,
+      pinnedFamily: family,
+      allAddresses: [rawBareHost],
+      validatedAddresses: [{ address: rawBareHost, family }],
+      isLoopbackTarget: loopbackAuthorized,
     };
   }
 
@@ -730,31 +875,67 @@ export async function validateAndResolveExternalUrl(
 
   let records: Array<{ address: string; family: number }>;
   try {
-    records = await lookupFn(bareHost);
+    records = await lookupFn(normalizedHost);
   } catch (err) {
-    throw new Error(
-      `DNS resolution failed for ${bareHost}: ${err instanceof Error ? err.message : 'lookup error'}`,
+    throw new EndpointPolicyError(
+      'dns_error',
+      `DNS resolution failed for ${normalizedHost}: ${err instanceof Error ? err.message : 'lookup error'}`,
     );
   }
 
   if (!records || records.length === 0) {
-    throw new Error(`DNS resolution returned no addresses for ${bareHost}`);
+    throw new EndpointPolicyError('dns_error', `DNS resolution returned no addresses for ${normalizedHost}`);
   }
 
-  // Validate EVERY resolved IPv4 and IPv6 record before permitting any connection
+  const seen = new Set<string>();
+  const validatedAddresses: ValidatedPinnedAddress[] = [];
+
+  // Validate EVERY resolved IPv4 and IPv6 record before permitting any connection.
+  // - If target hostname is explicit loopback (e.g. "localhost") under an authorized loopback policy,
+  //   EVERY resolved address MUST be a loopback IP (prevents poisoned hosts/DNS pointing localhost to LAN/metadata/public).
+  // - If target hostname is NOT explicit loopback (any external domain), EVERY resolved address MUST be public
+  //   (blocks DNS rebinding to 127.0.0.1, ::1, 169.254.169.254, 10/8, 192.168/16, etc., EVEN for loopback-capable AI providers!).
   for (const rec of records) {
-    const allowedLoopback = Boolean(options.allowLocalOllama && isLoopbackIp(bareHost) && isLoopbackIp(rec.address));
-    if (!allowedLoopback && isPrivateOrRestrictedIp(rec.address)) {
-      throw new Error(`Blocked DNS resolution to restricted/private network address (${bareHost} -> ${rec.address})`);
+    const addr = String(rec.address || '').trim();
+    const detectedFamily = net.isIP(addr);
+    if (detectedFamily !== 4 && detectedFamily !== 6) {
+      throw new EndpointPolicyError(
+        'blocked_endpoint',
+        `Blocked invalid DNS record (${normalizedHost} -> ${addr})`,
+      );
+    }
+
+    if (loopbackAuthorized) {
+      if (!isLoopbackIp(addr)) {
+        throw new EndpointPolicyError(
+          'blocked_endpoint',
+          `Blocked DNS resolution: loopback host "${normalizedHost}" resolved to non-loopback address (${addr})`,
+        );
+      }
+    } else if (isPrivateOrRestrictedIp(addr)) {
+      throw new EndpointPolicyError(
+        'blocked_endpoint',
+        `Blocked DNS resolution to restricted/private network address (${normalizedHost} -> ${addr})`,
+      );
+    }
+
+    if (!seen.has(addr)) {
+      seen.add(addr);
+      validatedAddresses.push({
+        address: addr,
+        family: detectedFamily === 6 ? 6 : 4,
+      });
     }
   }
 
-  const primary = records[0];
+  const primary = validatedAddresses[0];
   return {
     url: parsed,
     pinnedAddress: primary.address,
-    pinnedFamily: primary.family === 6 ? 6 : 4,
-    allAddresses: records.map((r) => r.address),
+    pinnedFamily: primary.family,
+    allAddresses: validatedAddresses.map((r) => r.address),
+    validatedAddresses,
+    isLoopbackTarget: loopbackAuthorized,
   };
 }
 
@@ -765,6 +946,7 @@ export interface SafeFetchOptions {
   timeoutMs?: number;
   maxBytes?: number;
   maxRedirects?: number;
+  policy?: NetworkAccessPolicy;
   allowLocalOllama?: boolean;
   allowedHosts?: string[];
   signal?: AbortSignal;
@@ -785,14 +967,47 @@ export interface SafeFetchResponse {
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+function getEffectivePort(u: URL): string {
+  if (u.port) return u.port;
+  return u.protocol === 'https:' ? '443' : '80';
+}
+
+function stripSensitiveHeadersForCrossOrigin(headers?: Record<string, string>): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const cleaned: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    const lower = k.toLowerCase();
+    if (lower === 'authorization' || lower === 'cookie' || lower === 'proxy-authorization' || lower === 'x-api-key') {
+      continue;
+    }
+    cleaned[k] = v;
+  }
+  return cleaned;
+}
+
+function isRetryableAddressConnectError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException)?.code;
+  return code === 'ECONNREFUSED' || code === 'EHOSTUNREACH' || code === 'ENETUNREACH' || code === 'EADDRNOTAVAIL';
+}
+
 export async function safeExternalFetch(rawUrl: string, options: SafeFetchOptions = {}): Promise<SafeFetchResponse> {
-  const maxRedirects = options.maxRedirects ?? 5;
+  const basePolicy = resolveEffectiveNetworkPolicy(options);
+  const maxRedirects = options.maxRedirects ?? basePolicy.maxRedirects ?? 5;
   const maxBytes = options.maxBytes ?? 2 * 1024 * 1024; // 2 MB default hard cap
   const timeoutMs = options.timeoutMs ?? 12000;
+  const enforceRedirectBoundary = basePolicy.enforceRedirectBoundary ?? true;
 
   let currentUrl = rawUrl;
   let currentMethod = (options.method || 'GET').toUpperCase();
   let currentBody = options.body;
+  let currentHeaders = options.headers ? { ...options.headers } : undefined;
+  let currentPolicy: NetworkAccessPolicy = basePolicy;
+  let initialOriginMeta: {
+    isLoopbackTarget: boolean;
+    protocol: string;
+    normalizedHost: string;
+    port: string;
+  } | null = null;
   let redirectCount = 0;
 
   while (true) {
@@ -801,27 +1016,117 @@ export async function safeExternalFetch(rawUrl: string, options: SafeFetchOption
     }
 
     const resolved = await validateAndResolveExternalUrl(currentUrl, {
-      allowLocalOllama: options.allowLocalOllama,
-      allowedHosts: options.allowedHosts,
+      policy: currentPolicy,
       customLookup: options.customLookup,
     });
 
-    const singleHop = await executePinnedHttpRequest(resolved, {
-      method: currentMethod,
-      headers: options.headers,
-      body: currentBody,
-      timeoutMs,
-      maxBytes,
-      signal: options.signal,
-    });
+    if (!initialOriginMeta) {
+      initialOriginMeta = {
+        isLoopbackTarget: resolved.isLoopbackTarget,
+        protocol: resolved.url.protocol,
+        normalizedHost: normalizeHostname(resolved.url.hostname),
+        port: getEffectivePort(resolved.url),
+      };
+    }
+
+    // Execute using strictly pinned addresses from the validated DNS snapshot (no re-lookup).
+    // If dual-stack (e.g. localhost -> ::1 and 127.0.0.1) fails with ECONNREFUSED on the first pinned family,
+    // try the next already-validated address from the exact same DNS snapshot.
+    let singleHop: Omit<SafeFetchResponse, 'finalUrl' | 'redirectCount'> | null = null;
+    let lastConnectErr: Error | null = null;
+    for (let i = 0; i < resolved.validatedAddresses.length; i++) {
+      const candidate = resolved.validatedAddresses[i];
+      const pinnedTarget: ResolvedExternalTarget =
+        i === 0
+          ? resolved
+          : {
+              ...resolved,
+              pinnedAddress: candidate.address,
+              pinnedFamily: candidate.family,
+            };
+      try {
+        singleHop = await executePinnedHttpRequest(pinnedTarget, {
+          method: currentMethod,
+          headers: currentHeaders,
+          body: currentBody,
+          timeoutMs,
+          maxBytes,
+          signal: options.signal,
+        });
+        lastConnectErr = null;
+        break;
+      } catch (err) {
+        lastConnectErr = err instanceof Error ? err : new Error(String(err));
+        const hasMoreValidated = i + 1 < resolved.validatedAddresses.length;
+        if (!hasMoreValidated || !isRetryableAddressConnectError(err) || options.signal?.aborted) {
+          throw lastConnectErr;
+        }
+      }
+    }
+
+    if (!singleHop) {
+      throw lastConnectErr || new Error('Failed to connect to target endpoint');
+    }
 
     if (REDIRECT_STATUSES.has(singleHop.status) && singleHop.headers.location) {
       if (redirectCount >= maxRedirects) {
-        throw new Error(`Exceeded maximum redirect limit (${maxRedirects})`);
+        throw new EndpointPolicyError('blocked_endpoint', `Exceeded maximum redirect limit (${maxRedirects})`);
       }
-      const nextUrl = new URL(singleHop.headers.location, resolved.url).toString();
+
+      let nextParsed: URL;
+      try {
+        nextParsed = new URL(singleHop.headers.location, resolved.url);
+      } catch {
+        throw new EndpointPolicyError('invalid_endpoint', 'Redirect target is not a valid URL');
+      }
+
+      const nextHostNormalized = normalizeHostname(nextParsed.hostname);
+      const nextPort = getEffectivePort(nextParsed);
+      const nextIsLoopback = isExplicitLoopbackHost(nextParsed.hostname);
+
+      if (enforceRedirectBoundary) {
+        if (isPrivateOrRestrictedIp(nextHostNormalized) && !nextIsLoopback) {
+          throw new EndpointPolicyError(
+            'blocked_endpoint',
+            `Blocked redirect to restricted internal or private network host: ${nextHostNormalized}`,
+          );
+        }
+
+        if (initialOriginMeta.isLoopbackTarget) {
+          // A loopback endpoint MUST NOT redirect to an external host, private LAN/metadata IP,
+          // different protocol, or even a different local service port.
+          const sameLoopbackOrigin =
+            nextIsLoopback &&
+            nextParsed.protocol === initialOriginMeta.protocol &&
+            nextPort === initialOriginMeta.port &&
+            nextHostNormalized === initialOriginMeta.normalizedHost;
+
+          if (!sameLoopbackOrigin) {
+            throw new EndpointPolicyError(
+              'blocked_endpoint',
+              `Blocked redirect from loopback endpoint (${initialOriginMeta.normalizedHost}:${initialOriginMeta.port}) to disallowed destination (${nextParsed.protocol}//${nextHostNormalized}:${nextPort})`,
+            );
+          }
+        } else {
+          // A public endpoint MUST NEVER pivot/redirect to loopback, private LAN, or metadata
+          // even if the base provider policy permits explicit loopback for initial configuration.
+          currentPolicy = {
+            ...PUBLIC_ONLY_NETWORK_POLICY,
+            allowedHosts: basePolicy.allowedHosts,
+            maxRedirects,
+            enforceRedirectBoundary: true,
+            policyName: `${basePolicy.policyName}:redirect_public_only`,
+          };
+        }
+      }
+
+      // Strip sensitive authentication headers whenever a redirect crosses origins
+      if (nextParsed.origin !== resolved.url.origin) {
+        currentHeaders = stripSensitiveHeadersForCrossOrigin(currentHeaders);
+      }
+
       redirectCount++;
-      currentUrl = nextUrl;
+      currentUrl = nextParsed.toString();
       if (singleHop.status === 303 || ((singleHop.status === 301 || singleHop.status === 302) && currentMethod === 'POST')) {
         currentMethod = 'GET';
         currentBody = undefined;
@@ -871,6 +1176,9 @@ function executePinnedHttpRequest(
       'Accept-Encoding': 'gzip, deflate, br',
       ...(opts.headers || {}),
     };
+    if (!Object.keys(reqHeaders).some((k) => k.toLowerCase() === 'host')) {
+      reqHeaders.Host = target.url.host;
+    }
     const bodyBuf =
       opts.body !== undefined ? (typeof opts.body === 'string' ? Buffer.from(opts.body, 'utf8') : opts.body) : undefined;
     if (bodyBuf && !Object.keys(reqHeaders).some((k) => k.toLowerCase() === 'content-length')) {
@@ -892,16 +1200,19 @@ function executePinnedHttpRequest(
       }
     };
 
+    // Strip IPv6 brackets for transport.request hostname while preserving target.url.host in Host header
+    const connectHostname = target.url.hostname.replace(/^\[|\]$/g, '');
+
     const req = transport.request(
       {
         protocol: target.url.protocol,
-        hostname: target.url.hostname,
+        hostname: connectHostname,
         port: target.url.port ? Number(target.url.port) : isHttps ? 443 : 80,
         path: `${target.url.pathname}${target.url.search}`,
         method: opts.method,
         headers: reqHeaders,
         lookup: pinnedLookup as unknown as typeof dns.lookup,
-        servername: isHttps && !net.isIP(target.url.hostname) ? target.url.hostname : undefined,
+        servername: isHttps && !net.isIP(connectHostname) ? connectHostname : undefined,
       },
       (res) => {
         const status = res.statusCode || 0;

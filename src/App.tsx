@@ -16,6 +16,10 @@ import {
   LogOut,
   Menu,
   X,
+  Globe,
+  Cpu,
+  Sliders,
+  Briefcase,
 } from 'lucide-react';
 import { apiRequest, formatShortDate, setAuthToken } from './client/api.ts';
 import { AuthGate } from './client/components/AuthGate.tsx';
@@ -27,6 +31,8 @@ import { AgentCenterView } from './client/components/AgentCenterView.tsx';
 import { ProjectWorkspaceView } from './client/components/ProjectWorkspaceView.tsx';
 import { QualityControlView } from './client/components/QualityControlView.tsx';
 import { SubmissionCenterView } from './client/components/SubmissionCenterView.tsx';
+import { PlatformAccountsView } from './client/components/PlatformAccountsView.tsx';
+import { AutomationView } from './client/components/AutomationView.tsx';
 import { AnalyticsView } from './client/components/AnalyticsView.tsx';
 import { TaskHistoryView } from './client/components/TaskHistoryView.tsx';
 import { JobSourcesView } from './client/components/JobSourcesView.tsx';
@@ -36,14 +42,18 @@ import type { DashboardData, NavSection, NotificationRecord } from './shared/typ
 const NAV_ITEMS: Array<{ id: NavSection; label: string; icon: React.ComponentType<{ className?: string }> }> = [
   { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { id: 'discovery', label: 'Job Discovery', icon: Search },
-  { id: 'job-details', label: 'Job Details', icon: FileSearch },
-  { id: 'proposals', label: 'Proposal Studio', icon: FileSignature },
-  { id: 'agents', label: 'AI Agent Center', icon: Bot },
-  { id: 'workspace', label: 'Project Workspace', icon: FolderKanban },
-  { id: 'qa', label: 'Quality Control', icon: ShieldCheck },
-  { id: 'submissions', label: 'Submission Center', icon: Send },
-  { id: 'analytics', label: 'Earnings & Analytics', icon: BarChart3 },
-  { id: 'tasks', label: 'Task History', icon: ListChecks },
+  { id: 'job-details', label: 'Job Analysis', icon: FileSearch },
+  { id: 'proposals', label: 'My Applications', icon: FileSignature },
+  { id: 'agents', label: 'AI Agents', icon: Bot },
+  { id: 'projects', label: 'Active Projects', icon: Briefcase },
+  { id: 'workspace', label: 'Workspaces', icon: FolderKanban },
+  { id: 'qa', label: 'QA Center', icon: ShieldCheck },
+  { id: 'submissions', label: 'Delivery Center', icon: Send },
+  { id: 'platform-accounts', label: 'Platform Accounts', icon: Globe },
+  { id: 'ai-providers', label: 'AI Providers', icon: Cpu },
+  { id: 'automation', label: 'Automation', icon: Sliders },
+  { id: 'tasks', label: 'Activity History', icon: ListChecks },
+  { id: 'analytics', label: 'Earnings & Reports', icon: BarChart3 },
   { id: 'sources', label: 'Job Sources', icon: Radio },
   { id: 'settings', label: 'Settings', icon: Settings },
 ];
@@ -415,7 +425,7 @@ export default function App() {
 
           {activeNav === 'agents' && <AgentCenterView />}
 
-          {activeNav === 'workspace' && (
+          {(activeNav === 'workspace' || activeNav === 'projects') && (
             <ProjectWorkspaceView
               initialProjectId={selectedProjectId}
               onNavigateSubmissions={() => navigate('submissions')}
@@ -425,7 +435,27 @@ export default function App() {
 
           {activeNav === 'qa' && <QualityControlView />}
 
-          {activeNav === 'submissions' && <SubmissionCenterView onChanged={refreshDashboardAndNotifications} />}
+          {activeNav === 'submissions' && (
+            <SubmissionCenterView
+              onOpenProject={(projectId) => {
+                setSelectedProjectId(projectId);
+                navigate('workspace');
+              }}
+              onNavigateAutomation={() => navigate('automation')}
+            />
+          )}
+
+          {activeNav === 'platform-accounts' && (
+            <PlatformAccountsView onNavigateSources={() => navigate('sources')} />
+          )}
+
+          {activeNav === 'ai-providers' && (
+            <SettingsView initialTab="providers" onSettingsChanged={refreshDashboardAndNotifications} />
+          )}
+
+          {activeNav === 'automation' && (
+            <AutomationView onApprovalChanged={refreshDashboardAndNotifications} />
+          )}
 
           {activeNav === 'analytics' && <AnalyticsView />}
 
@@ -433,7 +463,9 @@ export default function App() {
 
           {activeNav === 'sources' && <JobSourcesView onNavigateDiscovery={() => navigate('discovery')} />}
 
-          {activeNav === 'settings' && <SettingsView onSettingsChanged={refreshDashboardAndNotifications} />}
+          {activeNav === 'settings' && (
+            <SettingsView initialTab="scoring" onSettingsChanged={refreshDashboardAndNotifications} />
+          )}
         </main>
       </div>
     </div>

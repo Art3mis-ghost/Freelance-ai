@@ -1,7 +1,10 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import path from 'node:path';
+import { CONFIG } from '../config.ts';
 import { createNotification, getDb, getHubSettings, logAudit } from '../db/database.ts';
 import {
+  getProjectWorkspaceRoot,
   readSafeWorkspaceFile,
   resolveSafeWorkspacePath,
   wrapUntrustedForPrompt,
@@ -416,8 +419,60 @@ export function recoverInterruptedTasks(): number {
   return interrupted.length;
 }
 
-// Transactional project creation — prevents simultaneous double-approvals from creating duplicate projects
-export function approveJobIntoProject(jobId: string, proposalId?: string | null): {
+function buildJobBriefMarkdown(job: ReturnType<typeof mapJobRow>): string {
+  return [
+    `# ${job.title}`,
+    '',
+    `- Source: ${job.sourceName}`,
+    `- URL: ${job.jobUrl || 'Manual entry'}`,
+    `- Budget: ${job.budget ?? 'Not specified'} ${job.currency} (${job.paymentType})`,
+    `- Category: ${job.category}`,
+    `- Skills: ${job.skills.join(', ') || 'General'}`,
+    '',
+    '## Original Requirements',
+    job.description,
+  ].join('\n');
+}
+
+function ensureCanonicalProjectWorkspace(projectId: string, job: ReturnType<typeof mapJobRow>): string {
+  const workspacePath = initProjectWorkspace(projectId);
+  if (!safeWorkspaceFileExists(projectId, 'requirements/job_brief.md')) {
+    writeWorkspaceTextFile(projectId, 'requirements/job_brief.md', buildJobBriefMarkdown(job), false);
+  }
+  return workspacePath;
+}
+
+function findOrEnqueueProjectExecutionTask(projectId: string, jobId: string): AgentTaskRecord {
+  const db = getDb();
+  const existingTask = db
+    .prepare(
+      `SELECT * FROM agent_tasks
+       WHERE project_id = ? AND task_type = 'execute_project'
+       ORDER BY created_at DESC LIMIT 1`,
+    )
+    .get(projectId) as Record<string, unknown> | undefined;
+  if (existingTask) {
+    return mapAgentTaskRow(existingTask);
+  }
+  return enqueueTask({
+    taskType: 'execute_project',
+    agentType: 'execution_agent',
+    projectId,
+    jobId,
+    dedupeKey: `project_exec:${projectId}`,
+    priority: 2,
+  }).task;
+}
+
+// Transactional project creation — claims UNIQUE(job_id) in SQLite BEFORE touching disk (BUG 2)
+export function approveJobIntoProject(
+  jobId: string,
+  proposalId?: string | null,
+  options: {
+    simulateDbFailure?: boolean;
+    simulateWorkspaceFailure?: boolean;
+  } = {},
+): {
   project: ProjectRecord;
   task: AgentTaskRecord;
   alreadyExists: boolean;
@@ -426,112 +481,182 @@ export function approveJobIntoProject(jobId: string, proposalId?: string | null)
   const jobRow = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId) as Record<string, unknown> | undefined;
   if (!jobRow) throw new Error(`Job not found: ${jobId}`);
   const job = mapJobRow(jobRow);
-
-  const existing = db.prepare('SELECT * FROM projects WHERE job_id = ?').get(jobId) as
-    | Record<string, unknown>
-    | undefined;
-  if (existing) {
-    const existingTask = db
-      .prepare('SELECT * FROM agent_tasks WHERE project_id = ? ORDER BY created_at DESC LIMIT 1')
-      .get(String(existing.id)) as Record<string, unknown> | undefined;
-    const taskRes = existingTask
-      ? { task: mapAgentTaskRow(existingTask), deduplicated: true }
-      : enqueueTask({
-          taskType: 'execute_project',
-          agentType: 'execution_agent',
-          projectId: String(existing.id),
-          jobId,
-          dedupeKey: `project_exec:${existing.id}`,
-          priority: 2,
-        });
-    return { project: mapProjectRow(existing), task: taskRes.task, alreadyExists: true };
-  }
+  const previousJobStatus = String(jobRow.status || 'shortlisted');
 
   const settings = getHubSettings();
-  const projectId = `proj_${crypto.randomUUID().slice(0, 10)}`;
-  const workspacePath = initProjectWorkspace(projectId);
+  const candidateProjectId = `proj_${crypto.randomUUID().slice(0, 10)}`;
+  // Pure canonical path calculation ONLY — never creates any directory before DB commit succeeds
+  const canonicalWorkspacePath = getProjectWorkspaceRoot(candidateProjectId);
   const now = new Date().toISOString();
+
+  let winningProjectRow: Record<string, unknown> | undefined;
+  let createdByThisCall = false;
 
   db.exec('BEGIN IMMEDIATE');
   try {
-    db.prepare(`
-      INSERT INTO projects (
-        id, job_id, proposal_id, title, status, workspace_path, max_correction_attempts,
-        estimated_earnings, is_demo, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)
-    `).run(
-      projectId,
-      jobId,
-      proposalId || null,
-      job.title,
-      workspacePath,
-      settings.scheduler.maxCorrectionRetries,
-      job.budget ?? (job.estimatedHours ? job.estimatedHours * 35 : null),
-      job.isDemo ? 1 : 0,
-      now,
-      now,
-    );
+    const existingInsideTx = db
+      .prepare('SELECT * FROM projects WHERE job_id = ?')
+      .get(jobId) as Record<string, unknown> | undefined;
 
-    db.prepare('UPDATE jobs SET status = ?, date_updated = ? WHERE id = ?').run('approved', now, jobId);
-    db.exec('COMMIT');
+    if (existingInsideTx) {
+      winningProjectRow = existingInsideTx;
+      createdByThisCall = false;
+      db.exec('COMMIT');
+    } else {
+      if (options.simulateDbFailure) {
+        throw new Error('Simulated database failure before project commit');
+      }
+
+      db.prepare(`
+        INSERT INTO projects (
+          id, job_id, proposal_id, title, status, workspace_path, max_correction_attempts,
+          estimated_earnings, is_demo, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 'planning', ?, ?, ?, ?, ?, ?)
+      `).run(
+        candidateProjectId,
+        jobId,
+        proposalId || null,
+        job.title,
+        canonicalWorkspacePath,
+        settings.scheduler.maxCorrectionRetries,
+        job.budget ?? (job.estimatedHours ? job.estimatedHours * 35 : null),
+        job.isDemo ? 1 : 0,
+        now,
+        now,
+      );
+
+      db.prepare('UPDATE jobs SET status = ?, date_updated = ? WHERE id = ?').run('approved', now, jobId);
+      winningProjectRow = db.prepare('SELECT * FROM projects WHERE id = ?').get(candidateProjectId) as
+        | Record<string, unknown>
+        | undefined;
+      createdByThisCall = true;
+      db.exec('COMMIT');
+    }
   } catch (err) {
-    db.exec('ROLLBACK');
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      // ignore if already rolled back
+    }
+
+    // Concurrent race recovery: zero workspace directories were created by this losing call!
     const raced = db.prepare('SELECT * FROM projects WHERE job_id = ?').get(jobId) as
       | Record<string, unknown>
       | undefined;
     if (raced) {
-      const taskRes = enqueueTask({
-        taskType: 'execute_project',
-        agentType: 'execution_agent',
-        projectId: String(raced.id),
-        jobId,
-        dedupeKey: `project_exec:${raced.id}`,
-        priority: 2,
-      });
-      return { project: mapProjectRow(raced), task: taskRes.task, alreadyExists: true };
+      const winnerId = String(raced.id);
+      ensureCanonicalProjectWorkspace(winnerId, job);
+      const task = findOrEnqueueProjectExecutionTask(winnerId, jobId);
+      return { project: mapProjectRow(raced), task, alreadyExists: true };
     }
     throw err;
   }
 
-  // Write initial job brief into requirements/
-  writeWorkspaceTextFile(
-    projectId,
-    'requirements/job_brief.md',
-    [
-      `# ${job.title}`,
-      '',
-      `- Source: ${job.sourceName}`,
-      `- URL: ${job.jobUrl || 'Manual entry'}`,
-      `- Budget: ${job.budget ?? 'Not specified'} ${job.currency} (${job.paymentType})`,
-      `- Category: ${job.category}`,
-      `- Skills: ${job.skills.join(', ') || 'General'}`,
-      '',
-      '## Original Requirements',
-      job.description,
-    ].join('\n'),
-    false,
-  );
+  // Existing project path: reconcile missing workspace safely without creating a second project or duplicate task
+  if (!createdByThisCall && winningProjectRow) {
+    const existingId = String(winningProjectRow.id);
+    const reconciledPath = ensureCanonicalProjectWorkspace(existingId, job);
+    if (String(winningProjectRow.workspace_path || '') !== reconciledPath) {
+      db.prepare('UPDATE projects SET workspace_path = ?, updated_at = ? WHERE id = ?').run(
+        reconciledPath,
+        new Date().toISOString(),
+        existingId,
+      );
+      winningProjectRow = db.prepare('SELECT * FROM projects WHERE id = ?').get(existingId) as Record<string, unknown>;
+    }
+    const task = findOrEnqueueProjectExecutionTask(existingId, jobId);
+    return { project: mapProjectRow(winningProjectRow), task, alreadyExists: true };
+  }
+
+  // Winning creator path: initialize canonical workspace AFTER DB commit; compensate cleanly on failure
+  try {
+    const actualWorkspacePath = initProjectWorkspace(candidateProjectId);
+    if (options.simulateWorkspaceFailure) {
+      throw new Error('Simulated workspace initialization failure');
+    }
+    writeWorkspaceTextFile(candidateProjectId, 'requirements/job_brief.md', buildJobBriefMarkdown(job), false);
+    if (actualWorkspacePath !== canonicalWorkspacePath) {
+      db.prepare('UPDATE projects SET workspace_path = ?, updated_at = ? WHERE id = ?').run(
+        actualWorkspacePath,
+        new Date().toISOString(),
+        candidateProjectId,
+      );
+    }
+    logAudit('project_workspace_created', 'project', candidateProjectId, {
+      jobId,
+      workspacePath: actualWorkspacePath,
+    });
+  } catch (wsErr) {
+    // Safe compensating rollback: delete ONLY this exact project's DB row & partial workspace (NEVER another project)
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      const delRes = db.prepare('DELETE FROM projects WHERE id = ? AND job_id = ?').run(candidateProjectId, jobId);
+      if (delRes.changes > 0) {
+        db.prepare('UPDATE jobs SET status = ?, date_updated = ? WHERE id = ?').run(
+          previousJobStatus,
+          new Date().toISOString(),
+          jobId,
+        );
+      }
+      db.exec('COMMIT');
+    } catch {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore
+      }
+    }
+
+    // Verify no DB row references this projectId and that path is strictly confined before removing partial directory
+    try {
+      const stillReferenced = db.prepare('SELECT id FROM projects WHERE id = ?').get(candidateProjectId);
+      const baseDir = path.resolve(CONFIG.projectsDir);
+      const resolvedTarget = path.resolve(canonicalWorkspacePath);
+      if (!stillReferenced && resolvedTarget.startsWith(baseDir + path.sep) && fs.existsSync(resolvedTarget)) {
+        fs.rmSync(resolvedTarget, { recursive: true, force: true });
+      }
+    } catch {
+      // ignore cleanup error
+    }
+
+    logAudit(
+      'project_approval_rollback',
+      'project',
+      candidateProjectId,
+      {
+        jobId,
+        reason: wsErr instanceof Error ? wsErr.message.slice(0, 240) : 'Workspace initialization failed',
+      },
+      'error',
+    );
+    throw wsErr;
+  }
 
   const taskRes = enqueueTask({
     taskType: 'execute_project',
     agentType: 'execution_agent',
-    projectId,
+    projectId: candidateProjectId,
     jobId,
-    dedupeKey: `project_exec:${projectId}`,
+    dedupeKey: `project_exec:${candidateProjectId}`,
     priority: 2,
   });
 
-  logAudit('project_approved', 'project', projectId, { jobId, title: job.title });
+  logAudit('project_approved', 'project', candidateProjectId, {
+    jobId,
+    title: job.title,
+    previousJobStatus,
+    newJobStatus: 'approved',
+  });
   createNotification(
     'project_approved',
     `Project approved: ${job.title.slice(0, 60)}`,
     'Isolated workspace created and multi-agent execution pipeline queued.',
     'info',
     'project',
-    projectId,
+    candidateProjectId,
   );
 
-  const projRow = db.prepare('SELECT * FROM projects WHERE id = ?').get(projectId) as Record<string, unknown>;
+  const projRow = db.prepare('SELECT * FROM projects WHERE id = ?').get(candidateProjectId) as Record<string, unknown>;
   return { project: mapProjectRow(projRow), task: taskRes.task, alreadyExists: false };
 }
 

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { CONFIG, decryptSecretStrict, ensureDirectories, setKeyValidationStatus } from '../config.ts';
+import { isPlaceholderAiUrl, validateAiProviderEndpoint } from '../services/aiEndpointPolicy.ts';
 import type { HubSettings } from '../../shared/types.ts';
 
 let dbInstance: DatabaseSync | null = null;
@@ -93,6 +94,19 @@ export const DEFAULT_SETTINGS: HubSettings = {
     maxActiveProjects: 3,
     maxCorrectionRetries: 2,
     autoAnalyzeImported: true,
+  },
+  autonomy: {
+    level: 2,
+    maxDailyApplications: 10,
+    maxBidAmountUsd: 500,
+    maxDailySpendUsd: 0,
+    requireApprovalForPaidBids: true,
+    requireApprovalForContractAcceptance: true,
+    requireApprovalForFinalDelivery: true,
+    requireApprovalForClientMessages: true,
+    requireApprovalForExternalUploads: true,
+    pauseOnPolicyWarning: true,
+    pauseOnCaptchaOrMfa: true,
   },
   notifications: {
     highMatchJob: true,
@@ -574,6 +588,180 @@ function runMigrations(db: DatabaseSync): void {
       new Date().toISOString(),
     );
   }
+
+  if (!applied.has(4)) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS platform_accounts (
+        id TEXT PRIMARY KEY,
+        platform_key TEXT NOT NULL UNIQUE,
+        platform_name TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT 'freelance_marketplace',
+        status TEXT NOT NULL DEFAULT 'not_connected',
+        connection_method TEXT NOT NULL DEFAULT 'manual_import',
+        integration_mode TEXT NOT NULL DEFAULT 'MODE_C_MANUAL_ASSISTANCE',
+        supported_methods_json TEXT NOT NULL DEFAULT '[]',
+        enabled INTEGER NOT NULL DEFAULT 1,
+        account_identifier TEXT,
+        display_name TEXT,
+        profile_url TEXT,
+        encrypted_credentials TEXT,
+        credential_scope TEXT,
+        last_verified_at TEXT,
+        expires_at TEXT,
+        last_error TEXT,
+        policy_summary TEXT NOT NULL DEFAULT '',
+        compliance_restriction TEXT NOT NULL DEFAULT '',
+        capabilities_json TEXT NOT NULL DEFAULT '{}',
+        permitted_capabilities_json TEXT NOT NULL DEFAULT '{}',
+        permissions_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_platform_accounts_status ON platform_accounts(status);
+      CREATE INDEX IF NOT EXISTS idx_platform_accounts_key ON platform_accounts(platform_key);
+
+      CREATE TABLE IF NOT EXISTS platform_activity_logs (
+        id TEXT PRIMARY KEY,
+        platform_id TEXT NOT NULL REFERENCES platform_accounts(id) ON DELETE CASCADE,
+        action TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'info',
+        message TEXT NOT NULL,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_platform_logs_platform ON platform_activity_logs(platform_id, created_at);
+
+      CREATE TABLE IF NOT EXISTS approvals (
+        id TEXT PRIMARY KEY,
+        action_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        risk_level TEXT NOT NULL DEFAULT 'medium',
+        status TEXT NOT NULL DEFAULT 'pending',
+        related_entity_type TEXT,
+        related_entity_id TEXT,
+        platform_key TEXT,
+        estimated_cost_usd REAL,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        requested_by TEXT NOT NULL DEFAULT 'system',
+        decided_by TEXT,
+        decision_note TEXT,
+        created_at TEXT NOT NULL,
+        decided_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_approvals_entity ON approvals(related_entity_type, related_entity_id);
+
+      CREATE TABLE IF NOT EXISTS delivery_records (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL UNIQUE REFERENCES projects(id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        platform_key TEXT NOT NULL DEFAULT 'manual',
+        platform_name TEXT NOT NULL DEFAULT 'Manual Import',
+        status TEXT NOT NULL DEFAULT 'not_ready',
+        submission_method TEXT NOT NULL DEFAULT 'manual_upload',
+        approval_id TEXT REFERENCES approvals(id) ON DELETE SET NULL,
+        package_zip_path TEXT,
+        manifest_json TEXT,
+        delivery_summary TEXT,
+        submission_message TEXT,
+        external_reference TEXT,
+        confirmation_note TEXT,
+        submitted_at TEXT,
+        delivered_at TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_delivery_records_status ON delivery_records(status, updated_at);
+    `);
+
+    db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+      4,
+      'platform_accounts_delivery_approvals',
+      new Date().toISOString(),
+    );
+  }
+
+  if (!applied.has(5)) {
+    const safeAddColumn = (table: string, colDef: string) => {
+      try {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${colDef}`);
+      } catch {
+        // column already exists (idempotent migration)
+      }
+    };
+
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      safeAddColumn('delivery_records', "verification_source TEXT NOT NULL DEFAULT 'none'");
+      safeAddColumn('delivery_records', 'accepted_at TEXT');
+      safeAddColumn('delivery_records', 'paid_at TEXT');
+      safeAddColumn('platform_accounts', "verification_status TEXT NOT NULL DEFAULT 'not_connected'");
+      safeAddColumn('platform_accounts', 'verification_detail TEXT');
+
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS delivery_evidence (
+          id TEXT PRIMARY KEY,
+          delivery_id TEXT NOT NULL REFERENCES delivery_records(id) ON DELETE CASCADE,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          evidence_type TEXT NOT NULL,
+          verified_by_platform INTEGER NOT NULL DEFAULT 0,
+          summary TEXT NOT NULL,
+          external_reference TEXT,
+          actor TEXT NOT NULL DEFAULT 'operator',
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          recorded_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_delivery_evidence_delivery ON delivery_evidence(delivery_id, recorded_at);
+        CREATE INDEX IF NOT EXISTS idx_delivery_evidence_project ON delivery_evidence(project_id, recorded_at);
+
+        CREATE TABLE IF NOT EXISTS delivery_transitions (
+          id TEXT PRIMARY KEY,
+          delivery_id TEXT NOT NULL REFERENCES delivery_records(id) ON DELETE CASCADE,
+          project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+          from_status TEXT NOT NULL,
+          to_status TEXT NOT NULL,
+          actor TEXT NOT NULL DEFAULT 'operator',
+          reason TEXT NOT NULL,
+          evidence_id TEXT REFERENCES delivery_evidence(id) ON DELETE SET NULL,
+          recorded_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_delivery_transitions_delivery ON delivery_transitions(delivery_id, recorded_at);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_unique_job_id ON projects(job_id);
+      `);
+
+      // Non-destructively initialize verification_status for existing platform_accounts rows
+      db.exec(`
+        UPDATE platform_accounts
+        SET verification_status = CASE
+          WHEN integration_mode = 'MODE_D_PUBLIC_SOURCE' AND status = 'connected' THEN 'live_verification_successful'
+          WHEN status = 'api_unavailable' THEN 'api_unavailable'
+          WHEN status = 'requires_manual_login' THEN 'manual_verification_required'
+          WHEN status = 'expired' THEN 'authentication_expired'
+          WHEN encrypted_credentials IS NOT NULL AND encrypted_credentials != '' THEN 'credential_stored'
+          ELSE 'not_connected'
+        END
+        WHERE verification_status = 'not_connected';
+      `);
+
+      db.prepare('INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)').run(
+        5,
+        'delivery_state_evidence_and_platform_verification',
+        new Date().toISOString(),
+      );
+      db.exec('COMMIT');
+    } catch (err) {
+      db.exec('ROLLBACK');
+      throw err;
+    }
+  }
 }
 
 function seedDefaults(db: DatabaseSync): void {
@@ -635,6 +823,21 @@ function seedDefaults(db: DatabaseSync): void {
       searchFrequencyMinutes: 60,
       policyNote: 'Official public Arbeitnow JSON API (https://www.arbeitnow.com/api/job-board-api). Permitted public access.',
       endpointUrl: 'https://www.arbeitnow.com/api/job-board-api',
+    },
+    {
+      id: 'remoteok_public',
+      name: 'RemoteOK Public Remote API',
+      connectorType: 'public_api',
+      implementationStatus: 'functional',
+      enabled: 1,
+      automationAllowed: 1,
+      browserAutomationAllowed: 0,
+      connectionStatus: 'ready',
+      capabilities: ['search', 'job_retrieval', 'normalization', 'deduplication', 'health_check'],
+      rateLimitPerHour: 12,
+      searchFrequencyMinutes: 60,
+      policyNote: 'Official public RemoteOK JSON API (https://remoteok.com/api). Permitted public feed with attribution and rate limits.',
+      endpointUrl: 'https://remoteok.com/api',
     },
     {
       id: 'upwork',
@@ -834,6 +1037,313 @@ function seedDefaults(db: DatabaseSync): void {
       p.lastStatus,
     );
   }
+
+  // Sync .env provider configuration if DB still contains initial placeholder/unconfigured defaults
+  // Every .env URL is validated through the centralized provider-specific endpoint policy.
+  if (CONFIG.freeLlmBaseUrl && !isPlaceholderAiUrl(CONFIG.freeLlmBaseUrl)) {
+    try {
+      validateAiProviderEndpoint(CONFIG.freeLlmBaseUrl, 'freellmapi');
+      db.prepare(`
+        UPDATE ai_providers
+        SET api_url = ?,
+            model = CASE WHEN ? != '' THEN ? ELSE model END,
+            enabled = 1,
+            last_status = CASE WHEN last_status = 'unconfigured' THEN 'unknown' ELSE last_status END,
+            last_error = CASE WHEN last_status = 'unconfigured' THEN NULL ELSE last_error END
+        WHERE id = 'freellmapi' AND (api_url LIKE '%.example%' OR api_url = '' OR last_status = 'unconfigured')
+      `).run(CONFIG.freeLlmBaseUrl.trim(), CONFIG.freeLlmModel.trim(), CONFIG.freeLlmModel.trim());
+    } catch (err) {
+      console.warn(
+        `[AI Policy] Ignored invalid or blocked FREELLM_BASE_URL from environment: ${
+          err instanceof Error ? err.message : 'policy error'
+        }`,
+      );
+    }
+  }
+
+  if (CONFIG.openAiCompatBaseUrl && !isPlaceholderAiUrl(CONFIG.openAiCompatBaseUrl)) {
+    try {
+      validateAiProviderEndpoint(CONFIG.openAiCompatBaseUrl, 'openai_compatible');
+      db.prepare(`
+        UPDATE ai_providers
+        SET api_url = ?,
+            model = CASE WHEN ? != '' THEN ? ELSE model END,
+            enabled = 1,
+            last_status = CASE WHEN last_status = 'unconfigured' THEN 'unknown' ELSE last_status END,
+            last_error = CASE WHEN last_status = 'unconfigured' THEN NULL ELSE last_error END
+        WHERE id = 'openai_compat' AND (last_status = 'unconfigured' OR api_url = '')
+      `).run(CONFIG.openAiCompatBaseUrl.trim(), CONFIG.openAiCompatModel.trim(), CONFIG.openAiCompatModel.trim());
+    } catch (err) {
+      console.warn(
+        `[AI Policy] Ignored invalid or blocked OPENAI_COMPAT_BASE_URL from environment: ${
+          err instanceof Error ? err.message : 'policy error'
+        }`,
+      );
+    }
+  }
+
+  if (process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY') {
+    db.prepare(`
+      UPDATE ai_providers
+      SET enabled = 1,
+          last_status = CASE WHEN last_status = 'unconfigured' THEN 'unknown' ELSE last_status END,
+          last_error = CASE WHEN last_status = 'unconfigured' THEN NULL ELSE last_error END
+      WHERE id = 'gemini_fallback' AND last_status = 'unconfigured'
+    `).run();
+  }
+
+  seedDefaultPlatformAccounts(db, now);
+}
+
+function seedDefaultPlatformAccounts(db: DatabaseSync, now: string): void {
+  const defaultPermissions = {
+    allowDrafting: true,
+    allowManualHandoff: true,
+    allowOfficialApiCalls: false,
+    requireApprovalBeforeExternalAction: true,
+  };
+
+  const manualRestrictedPermitted = {
+    publicJobDiscovery: false,
+    authenticatedJobDiscovery: false,
+    jobDetails: false,
+    search: false,
+    applicationDrafting: true,
+    applicationSubmission: false,
+    messaging: false,
+    fileUploads: false,
+    deliverableSubmission: false,
+    applicationStatusTracking: true,
+    clientFeedbackRetrieval: false,
+    contractStatus: true,
+    apiAvailability: false,
+    browserInteractionPermitted: false,
+  };
+
+  const oauthCapablePermitted = {
+    ...manualRestrictedPermitted,
+    authenticatedJobDiscovery: true,
+    jobDetails: true,
+    search: true,
+    apiAvailability: true,
+    applicationSubmission: false,
+    deliverableSubmission: false,
+  };
+
+  const publicFeedPermitted = {
+    publicJobDiscovery: true,
+    authenticatedJobDiscovery: false,
+    jobDetails: true,
+    search: true,
+    applicationDrafting: true,
+    applicationSubmission: false,
+    messaging: false,
+    fileUploads: false,
+    deliverableSubmission: false,
+    applicationStatusTracking: true,
+    clientFeedbackRetrieval: false,
+    contractStatus: false,
+    apiAvailability: true,
+    browserInteractionPermitted: false,
+  };
+
+  const defaultPlatforms = [
+    {
+      id: 'plat_upwork',
+      platformKey: 'upwork',
+      platformName: 'Upwork',
+      category: 'freelance_marketplace',
+      status: 'requires_manual_login',
+      connectionMethod: 'manual_browser_assisted',
+      integrationMode: 'MODE_C_MANUAL_ASSISTANCE',
+      supportedMethods: ['official_oauth', 'manual_browser_assisted', 'manual_import'],
+      enabled: 1,
+      policySummary:
+        'Upwork enforces strict anti-scraping rules and requires approved OAuth API credentials for programmatic access. Default mode is Manual Assistance (import briefs, draft proposals, package deliverables, submit manually).',
+      complianceRestriction:
+        'No unauthorized scraping, CAPTCHA/MFA bypass, or automated proposal blasting. Official OAuth partner credentials are required to enable authenticated API read features.',
+      capabilities: { ...manualRestrictedPermitted },
+      permittedCapabilities: { ...oauthCapablePermitted },
+    },
+    {
+      id: 'plat_fiverr',
+      platformKey: 'fiverr',
+      platformName: 'Fiverr',
+      category: 'freelance_marketplace',
+      status: 'api_unavailable',
+      connectionMethod: 'manual_import',
+      integrationMode: 'MODE_C_MANUAL_ASSISTANCE',
+      supportedMethods: ['manual_browser_assisted', 'manual_import'],
+      enabled: 1,
+      policySummary:
+        'Fiverr does not offer a public freelancer automation API and prohibits bot scraping. Use Manual Assistance to import client briefs, execute projects, and prepare verified delivery bundles.',
+      complianceRestriction:
+        'Automated login, scraping, messaging, and submission are permanently blocked by platform policy.',
+      capabilities: { ...manualRestrictedPermitted },
+      permittedCapabilities: { ...manualRestrictedPermitted },
+    },
+    {
+      id: 'plat_freelancer',
+      platformKey: 'freelancer',
+      platformName: 'Freelancer.com',
+      category: 'freelance_marketplace',
+      status: 'not_connected',
+      connectionMethod: 'official_oauth',
+      integrationMode: 'MODE_C_MANUAL_ASSISTANCE',
+      supportedMethods: ['official_oauth', 'official_api_key', 'manual_browser_assisted', 'manual_import'],
+      enabled: 1,
+      policySummary:
+        'Freelancer.com provides an official OAuth2 Developer API. Connect your authorized OAuth token for permitted API access, or use Manual Assistance mode.',
+      complianceRestriction:
+        'Requires user-issued official API token; automated bidding without human approval is blocked.',
+      capabilities: { ...manualRestrictedPermitted },
+      permittedCapabilities: { ...oauthCapablePermitted },
+    },
+    {
+      id: 'plat_peopleperhour',
+      platformKey: 'peopleperhour',
+      platformName: 'PeoplePerHour',
+      category: 'freelance_marketplace',
+      status: 'api_unavailable',
+      connectionMethod: 'manual_import',
+      integrationMode: 'MODE_C_MANUAL_ASSISTANCE',
+      supportedMethods: ['manual_browser_assisted', 'manual_import'],
+      enabled: 1,
+      policySummary:
+        'No public freelancer API is available. Import opportunities manually, draft proposals in the hub, and submit deliverables through the official website.',
+      complianceRestriction: 'Unauthenticated scraping and headless browser bots are disabled.',
+      capabilities: { ...manualRestrictedPermitted },
+      permittedCapabilities: { ...manualRestrictedPermitted },
+    },
+    {
+      id: 'plat_guru',
+      platformKey: 'guru',
+      platformName: 'Guru',
+      category: 'freelance_marketplace',
+      status: 'api_unavailable',
+      connectionMethod: 'manual_import',
+      integrationMode: 'MODE_C_MANUAL_ASSISTANCE',
+      supportedMethods: ['manual_browser_assisted', 'manual_import'],
+      enabled: 1,
+      policySummary:
+        'Guru does not expose a general public freelancer API. Supported via compliant manual import, drafting, execution, QA, and manual delivery handoff.',
+      complianceRestriction: 'Automated scraping and unattended browser sessions are prohibited.',
+      capabilities: { ...manualRestrictedPermitted },
+      permittedCapabilities: { ...manualRestrictedPermitted },
+    },
+    {
+      id: 'plat_contra',
+      platformKey: 'contra',
+      platformName: 'Contra',
+      category: 'freelance_marketplace',
+      status: 'requires_manual_login',
+      connectionMethod: 'manual_browser_assisted',
+      integrationMode: 'MODE_C_MANUAL_ASSISTANCE',
+      supportedMethods: ['manual_browser_assisted', 'manual_import'],
+      enabled: 1,
+      policySummary:
+        'Contra operates authenticated opportunity feeds without a public freelancer API. Use Manual Assistance to track briefs, build deliverables, and upload verified work.',
+      complianceRestriction: 'No automated login, scraping, or unattended submission.',
+      capabilities: { ...manualRestrictedPermitted },
+      permittedCapabilities: { ...manualRestrictedPermitted },
+    },
+    {
+      id: 'plat_workana',
+      platformKey: 'workana',
+      platformName: 'Workana',
+      category: 'freelance_marketplace',
+      status: 'api_unavailable',
+      connectionMethod: 'manual_import',
+      integrationMode: 'MODE_C_MANUAL_ASSISTANCE',
+      supportedMethods: ['manual_browser_assisted', 'manual_import'],
+      enabled: 1,
+      policySummary:
+        'Workana requires manual marketplace interaction. Use Manual Assistance for opportunity intake, AI proposal drafting, project production, and delivery packaging.',
+      complianceRestriction: 'Automated scraping and browser automation are disabled by policy.',
+      capabilities: { ...manualRestrictedPermitted },
+      permittedCapabilities: { ...manualRestrictedPermitted },
+    },
+    {
+      id: 'plat_remotive',
+      platformKey: 'remotive_public',
+      platformName: 'Remotive',
+      category: 'remote_job_board',
+      status: 'connected',
+      connectionMethod: 'public_api',
+      integrationMode: 'MODE_D_PUBLIC_SOURCE',
+      supportedMethods: ['public_api', 'manual_import'],
+      enabled: 1,
+      policySummary:
+        'Official public Remotive JSON feed (https://remotive.com/api/remote-jobs). Active for permitted public remote job discovery with rate limits.',
+      complianceRestriction: 'Read-only public API discovery; applications are submitted directly on employer/Remotive pages.',
+      capabilities: { ...publicFeedPermitted },
+      permittedCapabilities: { ...publicFeedPermitted },
+    },
+    {
+      id: 'plat_remoteok',
+      platformKey: 'remoteok_public',
+      platformName: 'RemoteOK',
+      category: 'remote_job_board',
+      status: 'connected',
+      connectionMethod: 'public_api',
+      integrationMode: 'MODE_D_PUBLIC_SOURCE',
+      supportedMethods: ['public_api', 'manual_import'],
+      enabled: 1,
+      policySummary:
+        'Official public RemoteOK JSON API (https://remoteok.com/api). Active for permitted remote job discovery with attribution and rate limits.',
+      complianceRestriction: 'Read-only public feed; respects rate limits and links back to original RemoteOK listings.',
+      capabilities: { ...publicFeedPermitted },
+      permittedCapabilities: { ...publicFeedPermitted },
+    },
+    {
+      id: 'plat_arbeitnow',
+      platformKey: 'arbeitnow_public',
+      platformName: 'Arbeitnow',
+      category: 'remote_job_board',
+      status: 'connected',
+      connectionMethod: 'public_api',
+      integrationMode: 'MODE_D_PUBLIC_SOURCE',
+      supportedMethods: ['public_api', 'manual_import'],
+      enabled: 1,
+      policySummary:
+        'Official public Arbeitnow Job Board API (https://www.arbeitnow.com/api/job-board-api). Active for permitted public job discovery.',
+      complianceRestriction: 'Read-only public discovery feed; applications occur manually via official job links.',
+      capabilities: { ...publicFeedPermitted },
+      permittedCapabilities: { ...publicFeedPermitted },
+    },
+  ];
+
+  const insertPlatform = db.prepare(`
+    INSERT OR IGNORE INTO platform_accounts (
+      id, platform_key, platform_name, category, status, connection_method, integration_mode,
+      supported_methods_json, enabled, policy_summary, compliance_restriction,
+      capabilities_json, permitted_capabilities_json, permissions_json, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  for (const p of defaultPlatforms) {
+    insertPlatform.run(
+      p.id,
+      p.platformKey,
+      p.platformName,
+      p.category,
+      p.status,
+      p.connectionMethod,
+      p.integrationMode,
+      JSON.stringify(p.supportedMethods),
+      p.enabled,
+      p.policySummary,
+      p.complianceRestriction,
+      JSON.stringify(p.capabilities),
+      JSON.stringify(p.permittedCapabilities),
+      JSON.stringify({
+        ...defaultPermissions,
+        allowOfficialApiCalls: p.integrationMode === 'MODE_D_PUBLIC_SOURCE',
+      }),
+      now,
+      now,
+    );
+  }
 }
 
 export function getHubSettings(): HubSettings {
@@ -851,6 +1361,7 @@ export function getHubSettings(): HubSettings {
       filters: { ...DEFAULT_SETTINGS.filters, ...(parsed.filters || {}) },
       resourceLimits: { ...DEFAULT_SETTINGS.resourceLimits, ...(parsed.resourceLimits || {}) },
       scheduler: { ...DEFAULT_SETTINGS.scheduler, ...(parsed.scheduler || {}) },
+      autonomy: { ...DEFAULT_SETTINGS.autonomy, ...(parsed.autonomy || {}) },
       notifications: { ...DEFAULT_SETTINGS.notifications, ...(parsed.notifications || {}) },
     };
   } catch {

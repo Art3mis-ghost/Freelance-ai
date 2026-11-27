@@ -16,25 +16,33 @@ Run **Freelance AI Agent Hub** directly on your own Windows 10/11 PC or any stan
 
 ---
 
-## 2. Quick Start on Windows (PowerShell)
+## 2. Quick Start on Windows (PowerShell or Command Prompt)
 
-You can run the scripts from any directory (all scripts automatically resolve the repository root and read your configured `PORT` and `HOST` from `.env`):
+You can run the scripts from any directory (all scripts automatically resolve the repository root and read your configured `PORT` and `HOST` from `.env`).
+
+Use the `.cmd` launchers below so Windows does not block downloaded `.ps1` scripts with a PowerShell digital-signature error:
 
 ```powershell
 # 1. Verify Node >= 22.13 + node:sqlite, generate persistent secrets, build UI, init SQLite
-.\scripts\install.ps1
+.\scripts\install.cmd
 
 # 2. Launch unified server on your configured PORT (default http://127.0.0.1:3000)
-.\scripts\start.ps1
+.\scripts\start.cmd
 
 # 3. Verify health of server, SQLite database, and local Ollama
-.\scripts\check-health.ps1
+.\scripts\check-health.cmd
 
 # 4. Create a SQLite WAL-consistent, integrity-verified backup (+ optional separate encrypted key backup)
-.\scripts\backup.ps1 -PromptForKeyBackup
+.\scripts\backup.cmd -PromptForKeyBackup
 
 # 5. Stop the server cleanly
-.\scripts\stop.ps1
+.\scripts\stop.cmd
+```
+
+If you prefer calling the `.ps1` scripts directly without changing your system-wide PowerShell policy, run:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
 ---

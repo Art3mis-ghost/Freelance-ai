@@ -540,6 +540,11 @@ export async function runSourceSearch(
           category: inferCategory(j.title, cleanDesc),
         };
       });
+    } else if (sourceId === 'remoteok_public') {
+      const url = 'https://remoteok.com/api';
+      const res = await fetchFeedWithBackoff(url, ['remoteok.com', 'www.remoteok.com'], options.signal);
+      const payload = JSON.parse(res.bodyText) as unknown;
+      rawItems = normalizeRemoteOkPayload(payload, query, maxItems);
     }
 
     // Reset failure backoff on success
@@ -621,6 +626,104 @@ export async function runSourceSearch(
       duplicatesSkipped: 0,
       importedJobIds: [],
       error: errMsg,
+    };
+  }
+}
+
+export function normalizeRemoteOkPayload(
+  payload: unknown,
+  query = '',
+  maxItems = 25,
+): NormalizedJobInput[] {
+  if (!Array.isArray(payload)) return [];
+  const q = query.trim().toLowerCase();
+
+  // RemoteOK API returns a legal/metadata object at index 0 followed by job objects
+  const jobObjects = payload.filter(
+    (entry): entry is Record<string, unknown> =>
+      Boolean(entry && typeof entry === 'object' && ('position' in entry || 'title' in entry) && 'id' in entry),
+  );
+
+  const filtered = jobObjects.filter((j) => {
+    if (!q) return true;
+    const title = String(j.position || j.title || '').toLowerCase();
+    const desc = String(j.description || '').toLowerCase();
+    const tags = Array.isArray(j.tags) ? j.tags.map((t) => String(t).toLowerCase()) : [];
+    const company = String(j.company || '').toLowerCase();
+    return title.includes(q) || desc.includes(q) || company.includes(q) || tags.some((t) => t.includes(q));
+  });
+
+  return filtered.slice(0, maxItems).map((j) => {
+    const title = String(j.position || j.title || 'Remote Opportunity').trim();
+    const cleanDesc = stripHtml(String(j.description || title));
+    const minSal = Number(j.salary_min || 0);
+    const maxSal = Number(j.salary_max || 0);
+    const salaryFromFields = maxSal > 0 ? maxSal : minSal > 0 ? minSal : null;
+    const parsedFromText = extractBudgetFromText(cleanDesc);
+    const rawUrl = String(j.url || j.apply_url || '').trim();
+    const jobUrl =
+      rawUrl && /^https?:\/\//i.test(rawUrl)
+        ? rawUrl
+        : j.slug
+          ? `https://remoteok.com/remote-jobs/${encodeURIComponent(String(j.slug))}`
+          : null;
+
+    return {
+      sourceId: 'remoteok_public',
+      sourceName: 'RemoteOK',
+      sourceJobId: String(j.id),
+      jobUrl,
+      title,
+      description: cleanDesc || title,
+      clientInfo: {
+        company: String(j.company || 'Not listed'),
+        location: String(j.location || 'Worldwide Remote'),
+        salaryMin: minSal > 0 ? minSal : null,
+        salaryMax: maxSal > 0 ? maxSal : null,
+      },
+      budget: salaryFromFields ?? parsedFromText.budget,
+      currency: salaryFromFields ? 'USD' : parsedFromText.currency,
+      paymentType: salaryFromFields ? 'fixed' : parsedFromText.paymentType,
+      postedDate: j.date ? String(j.date) : j.epoch ? new Date(Number(j.epoch) * 1000).toISOString() : null,
+      skills: Array.isArray(j.tags) ? j.tags.map((t) => String(t)).slice(0, 12) : [],
+      category: inferCategory(title, cleanDesc),
+    };
+  });
+}
+
+export async function checkSourceHealth(sourceId: string): Promise<{ ok: boolean; message: string }> {
+  const source = listSources().find((s) => s.id === sourceId);
+  if (!source) {
+    return { ok: false, message: `Job source not found: ${sourceId}` };
+  }
+  if (source.implementationStatus === 'scaffold_manual_only') {
+    return { ok: true, message: `${source.name} is configured in Manual Import mode (policy-compliant).` };
+  }
+  if (!source.endpointUrl) {
+    return { ok: true, message: `${source.name} is ready.` };
+  }
+  try {
+    const parsed = new URL(source.endpointUrl);
+    const res = await safeExternalFetch(source.endpointUrl, {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'FreelanceAIAgentHub/1.0 (Permitted Public Feed Health Check)',
+        Accept: 'application/json',
+      },
+      timeoutMs: 8000,
+      maxBytes: 256 * 1024,
+      maxRedirects: 2,
+      allowedHosts: [parsed.hostname, parsed.hostname.replace(/^www\./, '')],
+      allowLocalOllama: false,
+    });
+    if (!res.ok) {
+      return { ok: false, message: `${source.name} returned HTTP ${res.status}.` };
+    }
+    return { ok: true, message: `${source.name} public API reachable (HTTP ${res.status}).` };
+  } catch (err) {
+    return {
+      ok: false,
+      message: err instanceof Error ? err.message : `Failed to reach ${source.name}.`,
     };
   }
 }

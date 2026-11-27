@@ -19,6 +19,7 @@ import {
   verifyStoredEncryptedSecrets,
 } from '../src/server/db/database.ts';
 import {
+  EndpointPolicyError,
   assertToolAuthorized,
   getRecentAuthFailures,
   isPrivateOrRestrictedIp,
@@ -31,14 +32,55 @@ import {
   validateExternalUrl,
   writeSafeWorkspaceFile,
 } from '../src/server/security.ts';
-import { checkProviderHealth } from '../src/server/services/aiRouter.ts';
+import {
+  fetchAiProviderEndpoint,
+  getAiProviderEndpointPolicy,
+  validateAiProviderEndpoint,
+  validateAndResolveAiProviderEndpoint,
+} from '../src/server/services/aiEndpointPolicy.ts';
+import {
+  checkProviderHealth,
+  deleteAiProvider,
+  generateWithRouter,
+  testProviderCompletion,
+  upsertAiProvider,
+} from '../src/server/services/aiRouter.ts';
 import { buildAnalyticsReport, recordProjectPayment } from '../src/server/services/analyticsService.ts';
 import {
   createFullVerifiedBackup,
   exportEncryptedKeyBackup,
   restoreEncryptedKeyBackup,
 } from '../src/server/services/backupService.ts';
-import { importNormalizedJob, parseCsvJobs, runSourceSearch } from '../src/server/services/connectors.ts';
+import { inspectPermittedPage } from '../src/server/services/browserAutomation.ts';
+import {
+  importFromPublicUrl,
+  importNormalizedJob,
+  normalizeRemoteOkPayload,
+  parseCsvJobs,
+  runSourceSearch,
+} from '../src/server/services/connectors.ts';
+import {
+  connectPlatformAccount,
+  createCustomPlatformAdapter,
+  disconnectPlatformAccount,
+  listPlatformAccounts,
+  listPlatformActivityLogs,
+  testPlatformConnection,
+  updatePlatformAccountPolicy,
+} from '../src/server/services/platformAccountsService.ts';
+import {
+  createApprovalRequest,
+  decideApproval,
+  getAutonomyConfig,
+  listApprovals,
+  updateAutonomyConfig,
+} from '../src/server/services/autonomyService.ts';
+import {
+  buildDeliveryReport,
+  formatDeliveryReportMarkdown,
+  prepareDeliveryPackage,
+  submitDelivery,
+} from '../src/server/services/deliveryService.ts';
 import { analyzeJobById } from '../src/server/services/jobAnalyst.ts';
 import { generateProposalForJob, listProposals } from '../src/server/services/proposalService.ts';
 import { evaluateProjectQa } from '../src/server/services/qaService.ts';
@@ -298,10 +340,47 @@ describe('Freelance AI Agent Hub — Full-Stack Integration & Security Suite', (
     expect(listProposals(jobId).length).toBe(2);
   });
 
-  it('5. AI Provider real health check & scaffold connector restriction', async () => {
+  it('5. AI Provider real health check, FreeLLMAPI config persistence, & scaffold connector restriction', async () => {
     // Unconfigured provider must report unconfigured/offline rather than faking online
     const health = await checkProviderHealth('freellmapi');
     expect(health.online).toBe(false);
+    expect(health.provider.lastStatus).toBe('unconfigured');
+
+    // Saving a real FreeLLMAPI endpoint URL + API key must clear 'unconfigured' immediately
+    const saveRes = await fetch(`${baseUrl}/api/ai-providers/freellmapi`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({
+        name: 'FreeLLMAPI (Configurable Fallback)',
+        providerType: 'freellmapi',
+        apiUrl: 'https://apifreellm.com/api/v1/chat',
+        apiKey: 'free-test-token-123456',
+        model: 'gpt-4o-mini',
+        contextLimit: 16384,
+        timeoutMs: 60000,
+        priority: 2,
+        role: 'fallback',
+        enabled: true,
+      }),
+    });
+    expect(saveRes.status).toBe(200);
+    const saved = (await saveRes.json()) as {
+      provider: { lastStatus: string; hasApiKey: boolean; apiUrl: string; enabled: boolean };
+    };
+    expect(saved.provider.lastStatus).not.toBe('unconfigured');
+    expect(saved.provider.hasApiKey).toBe(true);
+    expect(saved.provider.apiUrl).toBe('https://apifreellm.com/api/v1/chat');
+    expect(saved.provider.enabled).toBe(true);
+
+    // Restore freellmapi to disabled placeholder so offline pipeline tests remain deterministic
+    getDb()
+      .prepare(
+        "UPDATE ai_providers SET api_url = 'https://api.freellmapi.example/v1', encrypted_api_key = NULL, enabled = 0, last_status = 'unconfigured', last_error = NULL WHERE id = 'freellmapi'",
+      )
+      .run();
 
     // Scaffold platform connector must refuse automated scraping cleanly
     const blocked = await runSourceSearch('upwork', 'python', 5);
@@ -975,11 +1054,921 @@ describe('Freelance AI Agent Hub — Full-Stack Integration & Security Suite', (
     expect(installPs1).toContain("import('node:sqlite')");
     expect(installPs1).toContain('npm ci');
 
-    // Verify committed npm lockfile (standardized on npm without conflicting bun.lock)
+    // Verify committed npm lockfile (standardized on npm v3 lockfile)
     const lockPath = path.resolve(process.cwd(), 'package-lock.json');
     expect(fs.existsSync(lockPath)).toBe(true);
-    expect(fs.existsSync(path.resolve(process.cwd(), 'bun.lock'))).toBe(false);
     const lockJson = JSON.parse(fs.readFileSync(lockPath, 'utf8')) as { lockfileVersion?: number };
     expect(lockJson.lockfileVersion).toBe(3);
+  });
+
+  it('16. Centralized AI endpoint policy: loopback allowed for eligible AI providers, private/metadata/DNS-rebinding/non-AI blocked', async () => {
+    // Explicit loopback URLs permitted for FreeLLMAPI, generic OpenAI-compatible (Other Providers), and Ollama
+    for (const providerType of ['freellmapi', 'openai_compatible', 'ollama'] as const) {
+      expect(validateAiProviderEndpoint('http://127.0.0.1:31415/v1', providerType).hostname).toBe('127.0.0.1');
+      expect(validateAiProviderEndpoint('http://127.0.0.1:1234/v1', providerType).hostname).toBe('127.0.0.1');
+      expect(validateAiProviderEndpoint('http://127.0.0.1:8000/v1', providerType).hostname).toBe('127.0.0.1');
+      expect(validateAiProviderEndpoint('http://localhost:31415/v1', providerType).hostname).toBe('localhost');
+      expect(validateAiProviderEndpoint('http://localhost.:1234/v1', providerType).hostname).toBe('localhost.');
+      expect(validateAiProviderEndpoint('http://[::1]:31415/v1', providerType).hostname).toBe('[::1]');
+      expect(validateAiProviderEndpoint('http://[0:0:0:0:0:0:0:1]:1234/v1', providerType).hostname).toBe('[::1]');
+      expect(validateAiProviderEndpoint('http://[::ffff:127.0.0.1]:8000/v1', providerType).hostname).toContain('7f00:1');
+
+      // Private LAN, CGNAT, unspecified, IPv6 ULA/link-local, and cloud metadata MUST remain strictly BLOCKED
+      const forbiddenUrls = [
+        'http://10.0.0.5:8000/v1',
+        'http://172.16.0.10:8000/v1',
+        'http://192.168.1.50:1234/v1',
+        'http://100.64.0.1:8000/v1',
+        'http://0.0.0.0:11434/v1',
+        'http://[::]:11434/v1',
+        'http://169.254.169.254/latest/meta-data',
+        'http://[::ffff:169.254.169.254]/latest/meta-data',
+        'http://metadata.google.internal/computeMetadata/v1/',
+        'http://[fc00::1]:8000/v1',
+        'http://[fe80::1]:8000/v1',
+        'http://internal-service.local:8080/v1',
+        'http://secret.internal/v1',
+      ];
+      for (const badUrl of forbiddenUrls) {
+        expect(() => validateAiProviderEndpoint(badUrl, providerType)).toThrow(EndpointPolicyError);
+      }
+
+      // Invalid schemes & embedded credentials rejected as invalid_endpoint
+      expect(() => validateAiProviderEndpoint('file:///etc/passwd', providerType)).toThrow(/Only http and https/i);
+      expect(() => validateAiProviderEndpoint('http://user:pass@127.0.0.1:31415/v1', providerType)).toThrow(
+        /Embedded URL credentials/i,
+      );
+    }
+
+    // Cloud-only Gemini provider MUST reject loopback even if named "Ollama" or "FreeLLMAPI"
+    expect(getAiProviderEndpointPolicy('gemini').allowExplicitLoopback).toBe(false);
+    expect(() => validateAiProviderEndpoint('http://127.0.0.1:31415/v1', 'gemini')).toThrow(EndpointPolicyError);
+    expect(() => validateAiProviderEndpoint('http://localhost:11434', 'gemini')).toThrow(EndpointPolicyError);
+    expect(() =>
+      upsertAiProvider({
+        id: 'gemini_fallback',
+        name: 'Local Ollama Spoof',
+        providerType: 'gemini',
+        apiUrl: 'http://127.0.0.1:11434',
+        model: 'gemini-4-hydrogen',
+        contextLimit: 65536,
+        timeoutMs: 60000,
+        priority: 4,
+        role: 'fallback',
+        enabled: false,
+      }),
+    ).toThrow(/loopback/i);
+
+    // Localhost DNS resolution: valid loopback records pass and pin; poisoned records are blocked
+    const resolvedLocal = await validateAndResolveAiProviderEndpoint('http://localhost:31415/v1', 'freellmapi', async () => [
+      { address: '::1', family: 6 },
+      { address: '127.0.0.1', family: 4 },
+    ]);
+    expect(resolvedLocal.isLoopbackTarget).toBe(true);
+    expect(resolvedLocal.allAddresses).toEqual(['::1', '127.0.0.1']);
+
+    await expect(
+      validateAndResolveAiProviderEndpoint('http://localhost:31415/v1', 'freellmapi', async () => [
+        { address: '127.0.0.1', family: 4 },
+        { address: '192.168.1.25', family: 4 },
+      ]),
+    ).rejects.toThrow(/non-loopback address/i);
+
+    // DNS rebinding defense: external hostname resolving to 127.0.0.1, ::1, LAN, or metadata MUST be rejected
+    // EVEN under loopback-capable AI provider policies
+    for (const providerType of ['freellmapi', 'openai_compatible', 'ollama'] as const) {
+      await expect(
+        validateAndResolveAiProviderEndpoint('https://rebind.attacker.test/v1', providerType, async () => [
+          { address: '127.0.0.1', family: 4 },
+        ]),
+      ).rejects.toThrow(/restricted\/private/i);
+
+      await expect(
+        validateAndResolveAiProviderEndpoint('https://rebind6.attacker.test/v1', providerType, async () => [
+          { address: '::1', family: 6 },
+        ]),
+      ).rejects.toThrow(/restricted\/private/i);
+
+      await expect(
+        validateAndResolveAiProviderEndpoint('https://meta-rebind.attacker.test/v1', providerType, async () => [
+          { address: '169.254.169.254', family: 4 },
+        ]),
+      ).rejects.toThrow(/restricted\/private/i);
+    }
+
+    // Existing non-AI integrations MUST remain strictly locked to public-only SSRF protections
+    expect(() => validateExternalUrl('http://127.0.0.1:31415/v1')).toThrow(/loopback/i);
+    expect(() => validateExternalUrl('http://[::1]:1234/v1')).toThrow(/loopback/i);
+    expect(() => validateExternalUrl('http://localhost:8000/v1')).toThrow(/loopback/i);
+    await expect(importFromPublicUrl('http://127.0.0.1:31415/v1')).rejects.toThrow(/loopback/i);
+    const db = getDb();
+    db.prepare(
+      `INSERT OR REPLACE INTO sources (id, name, connector_type, implementation_status, enabled, automation_allowed, browser_automation_allowed, connection_status, created_at, updated_at)
+       VALUES ('test_browser_src', 'Test Browser Source', 'public_api', 'active', 1, 1, 1, 'connected', datetime('now'), datetime('now'))`,
+    ).run();
+    try {
+      await expect(inspectPermittedPage('test_browser_src', 'http://127.0.0.1:31415/v1')).rejects.toThrow(/loopback/i);
+      await expect(inspectPermittedPage('test_browser_src', 'http://169.254.169.254/latest/meta-data')).rejects.toThrow(
+        /restricted internal or private/i,
+      );
+    } finally {
+      db.prepare("DELETE FROM sources WHERE id = 'test_browser_src'").run();
+    }
+  });
+
+  it('17. Live localhost AI providers (FreeLLMAPI, Other Providers, IPv6 loopback, Ollama): auth, auto model, health check, completion & redirect isolation', async () => {
+    const EXPECTED_TOKEN = 'sk-local-ai-secret-777';
+    let lastAuthHeader = '';
+    let lastRequestedModel = '';
+
+    // Mock OpenAI-compatible local AI server (supports FreeLLMAPI, LM Studio, vLLM, and redirect/error scenarios)
+    const mockAiServer = http.createServer((req, res) => {
+      const auth = String(req.headers.authorization || '');
+      lastAuthHeader = auth;
+
+      if (req.url === '/redir-external') {
+        res.writeHead(302, { Location: 'https://example.com/exfiltrate' });
+        res.end();
+        return;
+      }
+      if (req.url === '/redir-lan') {
+        res.writeHead(302, { Location: 'http://192.168.1.1/router' });
+        res.end();
+        return;
+      }
+      if (req.url === '/redir-metadata') {
+        res.writeHead(302, { Location: 'http://169.254.169.254/latest/meta-data/' });
+        res.end();
+        return;
+      }
+      if (req.url === '/redir-other-port') {
+        res.writeHead(302, { Location: 'http://127.0.0.1:9999/other-local-service' });
+        res.end();
+        return;
+      }
+      if (req.url === '/redir-same-origin/models') {
+        res.writeHead(302, { Location: '/v1/models' });
+        res.end();
+        return;
+      }
+      if (req.url === '/slow/models' || req.url === '/slow/chat/completions') {
+        setTimeout(() => {
+          if (!res.writableEnded) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ data: [] }));
+          }
+        }, 1200);
+        return;
+      }
+      if (req.url === '/err500/models' || req.url === '/err500/chat/completions') {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Upstream inference worker crashed' } }));
+        return;
+      }
+
+      if (auth !== `Bearer ${EXPECTED_TOKEN}`) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Invalid API key' } }));
+        return;
+      }
+
+      if (req.url === '/v1/models' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ data: [{ id: 'auto' }, { id: 'qwen2.5-7b-instruct' }] }));
+        return;
+      }
+
+      if (req.url === '/v1/chat/completions' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => {
+          body += chunk;
+        });
+        req.on('end', () => {
+          const parsed = JSON.parse(body || '{}') as { model?: string };
+          lastRequestedModel = parsed.model || '';
+          if (parsed.model === 'nonexistent-model-xyz') {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'The model nonexistent-model-xyz does not exist', code: 'model_not_found' } }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              id: 'chatcmpl-local-1',
+              choices: [{ message: { role: 'assistant', content: `READY:${parsed.model}` } }],
+            }),
+          );
+        });
+        return;
+      }
+
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not found' }));
+    });
+
+    // Mock Ollama server on 127.0.0.1
+    const mockOllamaServer = http.createServer((req, res) => {
+      if (req.url === '/api/tags' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ models: [{ name: 'llama3.1:8b' }] }));
+        return;
+      }
+      if (req.url === '/api/chat' && req.method === 'POST') {
+        let body = '';
+        req.on('data', (chunk) => {
+          body += chunk;
+        });
+        req.on('end', () => {
+          const parsed = JSON.parse(body || '{}') as { model?: string };
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ message: { role: 'assistant', content: `OLLAMA_READY:${parsed.model}` } }));
+        });
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+
+    // Mock IPv6 loopback server on ::1 (if environment supports IPv6)
+    let mockIpv6Server: http.Server | null = null;
+    let ipv6Port = 0;
+
+    await new Promise<void>((resolve) => mockAiServer.listen(0, '127.0.0.1', () => resolve()));
+    await new Promise<void>((resolve) => mockOllamaServer.listen(0, '127.0.0.1', () => resolve()));
+    const aiPort = (mockAiServer.address() as { port: number }).port;
+    const ollamaPort = (mockOllamaServer.address() as { port: number }).port;
+
+    try {
+      const s6 = http.createServer((req, res) => {
+        if (req.url === '/v1/models') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ data: [{ id: 'ipv6-local-model' }] }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: 'IPV6_LOOPBACK_OK' } }] }));
+      });
+      await new Promise<void>((resolve, reject) => {
+        s6.once('error', reject);
+        s6.listen(0, '::1', () => resolve());
+      });
+      mockIpv6Server = s6;
+      ipv6Port = (s6.address() as { port: number }).port;
+    } catch {
+      mockIpv6Server = null;
+    }
+
+    const db = getDb();
+    const createdCustomIds: string[] = [];
+
+    try {
+      // 1. FreeLLMAPI on IPv4 loopback with encrypted API key & model "auto"
+      const saveFreeRes = await fetch(`${baseUrl}/api/ai-providers/freellmapi`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+        body: JSON.stringify({
+          name: 'FreeLLMAPI Local Bridge',
+          providerType: 'freellmapi',
+          apiUrl: `http://127.0.0.1:${aiPort}/v1`,
+          apiKey: EXPECTED_TOKEN,
+          model: 'auto',
+          contextLimit: 16384,
+          timeoutMs: 10000,
+          priority: 2,
+          role: 'fallback',
+          enabled: true,
+        }),
+      });
+      expect(saveFreeRes.status).toBe(200);
+      const freeSaved = (await saveFreeRes.json()) as { provider: { hasApiKey: boolean; model: string; lastStatus: string } };
+      expect(freeSaved.provider.hasApiKey).toBe(true);
+      expect(freeSaved.provider.model).toBe('auto');
+      expect(freeSaved.provider.lastStatus).not.toBe('unconfigured');
+
+      const freeHealthRes = await fetch(`${baseUrl}/api/ai-providers/freellmapi/health`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      expect(freeHealthRes.status).toBe(200);
+      const freeHealth = (await freeHealthRes.json()) as {
+        online: boolean;
+        availableModels: string[];
+        errorCode: string | null;
+      };
+      expect(freeHealth.online).toBe(true);
+      expect(freeHealth.errorCode).toBeNull();
+      expect(freeHealth.availableModels).toContain('auto');
+      expect(lastAuthHeader).toBe(`Bearer ${EXPECTED_TOKEN}`);
+
+      const freeTestRes = await fetch(`${baseUrl}/api/ai-providers/freellmapi/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+        body: JSON.stringify({ prompt: 'Ping' }),
+      });
+      expect(freeTestRes.status).toBe(200);
+      const freeTest = (await freeTestRes.json()) as { ok: boolean; result: { text: string; model: string } };
+      expect(freeTest.ok).toBe(true);
+      expect(freeTest.result.text).toBe('READY:auto');
+      expect(lastRequestedModel).toBe('auto');
+
+      // 2. Other Providers (generic OpenAI-compatible, e.g. LM Studio / local vLLM) via POST /api/ai-providers using localhost
+      const createOtherRes = await fetch(`${baseUrl}/api/ai-providers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+        body: JSON.stringify({
+          id: 'lm_studio_local',
+          name: 'Local LM Studio',
+          providerType: 'openai_compatible',
+          apiUrl: `http://localhost:${aiPort}/v1`,
+          apiKey: EXPECTED_TOKEN,
+          model: 'auto',
+          priority: 5,
+          enabled: true,
+        }),
+      });
+      expect(createOtherRes.status).toBe(201);
+      createdCustomIds.push('lm_studio_local');
+
+      const otherHealth = await checkProviderHealth('lm_studio_local');
+      expect(otherHealth.online).toBe(true);
+      expect(otherHealth.errorCode).toBeNull();
+      const otherCompletion = await testProviderCompletion('lm_studio_local', 'Ping LM Studio');
+      expect(otherCompletion.text).toBe('READY:auto');
+
+      // 3. IPv6 loopback [::1] live health check and completion
+      if (mockIpv6Server && ipv6Port > 0) {
+        upsertAiProvider({
+          id: 'vllm_ipv6_local',
+          name: 'Local vLLM IPv6',
+          providerType: 'openai_compatible',
+          apiUrl: `http://[::1]:${ipv6Port}/v1`,
+          model: 'ipv6-local-model',
+          contextLimit: 16384,
+          timeoutMs: 10000,
+          priority: 6,
+          role: 'fallback',
+          enabled: true,
+        });
+        createdCustomIds.push('vllm_ipv6_local');
+        const v6Health = await checkProviderHealth('vllm_ipv6_local');
+        expect(v6Health.online).toBe(true);
+        const v6Comp = await testProviderCompletion('vllm_ipv6_local');
+        expect(v6Comp.text).toBe('IPV6_LOOPBACK_OK');
+      }
+
+      // 4. Ollama compatibility preserved on loopback
+      upsertAiProvider({
+        id: 'ollama_local',
+        name: 'Local Ollama (Primary)',
+        providerType: 'ollama',
+        apiUrl: `http://127.0.0.1:${ollamaPort}`,
+        model: 'llama3.1:8b',
+        contextLimit: 8192,
+        timeoutMs: 10000,
+        priority: 1,
+        role: 'primary',
+        enabled: true,
+      });
+      const ollamaHealth = await checkProviderHealth('ollama_local');
+      expect(ollamaHealth.online).toBe(true);
+      expect(ollamaHealth.availableModels).toContain('llama3.1:8b');
+      const ollamaComp = await testProviderCompletion('ollama_local');
+      expect(ollamaComp.text).toBe('OLLAMA_READY:llama3.1:8b');
+
+      // 5. Redirect boundary policy enforcement
+      // Loopback -> external, LAN, metadata, or different local port MUST be blocked
+      await expect(
+        fetchAiProviderEndpoint(`http://127.0.0.1:${aiPort}/redir-external`, 'freellmapi'),
+      ).rejects.toThrow(/Blocked redirect/i);
+      await expect(
+        fetchAiProviderEndpoint(`http://127.0.0.1:${aiPort}/redir-lan`, 'openai_compatible'),
+      ).rejects.toThrow(/restricted internal or private/i);
+      await expect(
+        fetchAiProviderEndpoint(`http://127.0.0.1:${aiPort}/redir-metadata`, 'freellmapi'),
+      ).rejects.toThrow(/restricted internal or private/i);
+      await expect(
+        fetchAiProviderEndpoint(`http://127.0.0.1:${aiPort}/redir-other-port`, 'openai_compatible'),
+      ).rejects.toThrow(/Blocked redirect/i);
+
+      // Same-origin loopback path redirect MUST succeed
+      const sameOriginRes = await fetchAiProviderEndpoint(
+        `http://127.0.0.1:${aiPort}/redir-same-origin/models`,
+        'freellmapi',
+        { headers: { Authorization: `Bearer ${EXPECTED_TOKEN}` } },
+      );
+      expect(sameOriginRes.status).toBe(200);
+      expect(sameOriginRes.redirectCount).toBe(1);
+
+      // Public -> Loopback redirect MUST be blocked even under loopback-capable AI provider policy
+      await expect(
+        safeExternalFetch('http://public-ai.example.test/redir-other-port', {
+          policy: getAiProviderEndpointPolicy('freellmapi'),
+          // Note: simulate public host resolving to a public IP that returns 302 to 127.0.0.1 is verified
+          // by first checking public->loopback redirect target validation on the policy boundary.
+          customLookup: async (host) => {
+            if (host === 'public-ai.example.test') {
+              return [{ address: '127.0.0.1', family: 4 }];
+            }
+            return [{ address: '127.0.0.1', family: 4 }];
+          },
+        }),
+      ).rejects.toThrow(/restricted\/private/i);
+
+      // 6. Distinct error classification across all 7 categories + NO silent fallback in testProviderCompletion
+      // (a) blocked_endpoint on save (private LAN / metadata)
+      const blockedSaveRes = await fetch(`${baseUrl}/api/ai-providers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+        body: JSON.stringify({
+          name: 'Evil LAN Provider',
+          providerType: 'openai_compatible',
+          apiUrl: 'http://192.168.1.100:8000/v1',
+          model: 'auto',
+          enabled: true,
+        }),
+      });
+      expect(blockedSaveRes.status).toBe(400);
+      const blockedSaveJson = (await blockedSaveRes.json()) as { errorCode: string };
+      expect(blockedSaveJson.errorCode).toBe('blocked_endpoint');
+
+      // (b) invalid_endpoint on save
+      const invalidSaveRes = await fetch(`${baseUrl}/api/ai-providers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+        body: JSON.stringify({
+          name: 'Bad Scheme',
+          providerType: 'freellmapi',
+          apiUrl: 'ftp://127.0.0.1:31415/v1',
+          model: 'auto',
+          enabled: true,
+        }),
+      });
+      expect(invalidSaveRes.status).toBe(400);
+      const invalidSaveJson = (await invalidSaveRes.json()) as { errorCode: string };
+      expect(invalidSaveJson.errorCode).toBe('invalid_endpoint');
+
+      // (c) auth_failure (wrong API key) — must NOT silently fall back to online Ollama!
+      upsertAiProvider({
+        id: 'auth_fail_test',
+        name: 'Bad Key Local Provider',
+        providerType: 'openai_compatible',
+        apiUrl: `http://127.0.0.1:${aiPort}/v1`,
+        apiKey: 'wrong-key-000',
+        model: 'auto',
+        contextLimit: 16384,
+        timeoutMs: 5000,
+        priority: 7,
+        role: 'fallback',
+        enabled: true,
+      });
+      createdCustomIds.push('auth_fail_test');
+      const authHealth = await checkProviderHealth('auth_fail_test');
+      expect(authHealth.online).toBe(false);
+      expect(authHealth.errorCode).toBe('auth_failure');
+      expect(authHealth.provider.lastStatus).toBe('error');
+
+      const authTestRes = await fetch(`${baseUrl}/api/ai-providers/auth_fail_test/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+        body: JSON.stringify({}),
+      });
+      expect(authTestRes.status).toBe(400);
+      const authTestJson = (await authTestRes.json()) as { ok: boolean; errorCode: string };
+      expect(authTestJson.ok).toBe(false);
+      expect(authTestJson.errorCode).toBe('auth_failure');
+
+      // (d) invalid_model
+      upsertAiProvider({
+        id: 'invalid_model_test',
+        name: 'Invalid Model Provider',
+        providerType: 'openai_compatible',
+        apiUrl: `http://127.0.0.1:${aiPort}/v1`,
+        apiKey: EXPECTED_TOKEN,
+        model: 'nonexistent-model-xyz',
+        contextLimit: 16384,
+        timeoutMs: 5000,
+        priority: 8,
+        role: 'fallback',
+        enabled: true,
+      });
+      createdCustomIds.push('invalid_model_test');
+      const invalidModelRes = await fetch(`${baseUrl}/api/ai-providers/invalid_model_test/test`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${authToken}` },
+        body: JSON.stringify({}),
+      });
+      expect(invalidModelRes.status).toBe(400);
+      const invalidModelJson = (await invalidModelRes.json()) as { ok: boolean; errorCode: string };
+      expect(invalidModelJson.errorCode).toBe('invalid_model');
+
+      // (e) server_error (HTTP 502)
+      upsertAiProvider({
+        id: 'server_err_test',
+        name: 'Server 502 Provider',
+        providerType: 'openai_compatible',
+        apiUrl: `http://127.0.0.1:${aiPort}/err500`,
+        apiKey: EXPECTED_TOKEN,
+        model: 'auto',
+        contextLimit: 16384,
+        timeoutMs: 5000,
+        priority: 9,
+        role: 'fallback',
+        enabled: true,
+      });
+      createdCustomIds.push('server_err_test');
+      const err500Health = await checkProviderHealth('server_err_test');
+      expect(err500Health.online).toBe(false);
+      expect(err500Health.errorCode).toBe('server_error');
+
+      // (f) timeout
+      upsertAiProvider({
+        id: 'timeout_test',
+        name: 'Slow Local Provider',
+        providerType: 'openai_compatible',
+        apiUrl: `http://127.0.0.1:${aiPort}/slow`,
+        apiKey: EXPECTED_TOKEN,
+        model: 'auto',
+        contextLimit: 16384,
+        timeoutMs: 150,
+        priority: 10,
+        role: 'fallback',
+        enabled: true,
+      });
+      createdCustomIds.push('timeout_test');
+      const timeoutHealth = await checkProviderHealth('timeout_test');
+      expect(timeoutHealth.online).toBe(false);
+      expect(timeoutHealth.errorCode).toBe('timeout');
+      expect(timeoutHealth.provider.lastStatus).toBe('offline');
+
+      // (g) connection_refused (unbound local port)
+      const closedSrv = http.createServer();
+      await new Promise<void>((resolve) => closedSrv.listen(0, '127.0.0.1', () => resolve()));
+      const unusedPort = (closedSrv.address() as { port: number }).port;
+      await new Promise<void>((resolve) => closedSrv.close(() => resolve()));
+
+      upsertAiProvider({
+        id: 'conn_refused_test',
+        name: 'Stopped Local Provider',
+        providerType: 'freellmapi',
+        apiUrl: `http://127.0.0.1:${unusedPort}/v1`,
+        model: 'auto',
+        contextLimit: 16384,
+        timeoutMs: 5000,
+        priority: 11,
+        role: 'fallback',
+        enabled: true,
+      });
+      createdCustomIds.push('conn_refused_test');
+      const refusedHealth = await checkProviderHealth('conn_refused_test');
+      expect(refusedHealth.online).toBe(false);
+      expect(refusedHealth.errorCode).toBe('connection_refused');
+      expect(refusedHealth.provider.lastStatus).toBe('offline');
+
+      // Delete custom provider works; built-in provider deletion is rejected
+      const delRes = await fetch(`${baseUrl}/api/ai-providers/lm_studio_local`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
+      expect(delRes.status).toBe(200);
+      expect(() => deleteAiProvider('freellmapi')).toThrow(/Built-in provider/i);
+    } finally {
+      for (const cid of createdCustomIds) {
+        db.prepare('DELETE FROM ai_providers WHERE id = ?').run(cid);
+      }
+      db.prepare(
+        "UPDATE ai_providers SET name = 'FreeLLMAPI (Configurable Fallback)', api_url = 'https://api.freellmapi.example/v1', encrypted_api_key = NULL, model = 'gpt-4o-mini', enabled = 0, last_status = 'unconfigured', last_error = NULL WHERE id = 'freellmapi'",
+      ).run();
+      db.prepare(
+        "UPDATE ai_providers SET api_url = 'http://127.0.0.1:11434', model = 'llama3.1:8b', enabled = 1, last_status = 'unknown', last_error = NULL WHERE id = 'ollama_local'",
+      ).run();
+      await new Promise<void>((resolve) => mockAiServer.close(() => resolve()));
+      await new Promise<void>((resolve) => mockOllamaServer.close(() => resolve()));
+      if (mockIpv6Server) {
+        await new Promise<void>((resolve) => mockIpv6Server.close(() => resolve()));
+      }
+    }
+  });
+
+  it('18. Migration v4 + Platform Accounts Center: 10 seeded platforms, policy enforcement, encrypted credential isolation/expiry/wipe & custom adapters', async () => {
+    const db = getDb();
+    const migrations = db
+      .prepare('SELECT version, name FROM schema_migrations ORDER BY version ASC')
+      .all() as Array<{ version: number; name: string }>;
+    expect(migrations.some((m) => m.version === 4 && m.name === 'platform_accounts_delivery_approvals')).toBe(true);
+
+    // All 10 platforms seeded with accurate modes & zero fake connected marketplaces
+    const accounts = listPlatformAccounts();
+    expect(accounts.length).toBeGreaterThanOrEqual(10);
+    const upwork = accounts.find((a) => a.platformKey === 'upwork')!;
+    const fiverr = accounts.find((a) => a.platformKey === 'fiverr')!;
+    const freelancer = accounts.find((a) => a.platformKey === 'freelancer')!;
+    const remoteok = accounts.find((a) => a.platformKey === 'remoteok_public')!;
+
+    expect(upwork.integrationMode).toBe('MODE_C_MANUAL_ASSISTANCE');
+    expect(upwork.status).not.toBe('connected');
+    expect(fiverr.integrationMode).toBe('MODE_C_MANUAL_ASSISTANCE');
+    expect(fiverr.status).toBe('api_unavailable');
+    expect(remoteok.integrationMode).toBe('MODE_D_PUBLIC_SOURCE');
+    expect(remoteok.status).toBe('connected');
+
+    // Policy Engine: attempting to enable prohibited scraping/submission on Fiverr is blocked
+    const updatedFiverr = updatePlatformAccountPolicy(fiverr.id, {
+      capabilities: {
+        authenticatedJobDiscovery: true,
+        deliverableSubmission: true,
+        browserInteractionPermitted: true,
+      },
+    });
+    expect(updatedFiverr.capabilities.authenticatedJobDiscovery).toBe(false);
+    expect(updatedFiverr.capabilities.deliverableSubmission).toBe(false);
+    expect(updatedFiverr.capabilities.browserInteractionPermitted).toBe(false);
+    expect(() =>
+      updatePlatformAccountPolicy(fiverr.id, { integrationMode: 'MODE_A_OFFICIAL_API' }),
+    ).toThrow(/official permitted API/i);
+
+    // Official API token connection on Freelancer.com: encrypted at rest, never leaked in API payload, expiry detected, disconnect wipes
+    const secretToken = 'fln_live_oauth_token_super_secret_987654';
+    const connectedFl = connectPlatformAccount(freelancer.id, {
+      connectionMethod: 'official_oauth',
+      accountIdentifier: 'dev@freelancer.example',
+      displayName: 'Lead Developer',
+      credentialSecret: secretToken,
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    });
+    expect(connectedFl.status).toBe('connected');
+    expect(connectedFl.integrationMode).toBe('MODE_A_OFFICIAL_API');
+    expect(connectedFl.hasStoredCredentials).toBe(true);
+    expect(JSON.stringify(connectedFl)).not.toContain(secretToken);
+
+    // Raw SQLite row holds encrypted ciphertext, never plaintext token
+    const rawRow = db
+      .prepare('SELECT encrypted_credentials FROM platform_accounts WHERE id = ?')
+      .get(freelancer.id) as { encrypted_credentials: string };
+    expect(rawRow.encrypted_credentials).toBeTruthy();
+    expect(rawRow.encrypted_credentials).not.toContain(secretToken);
+
+    const testOk = await testPlatformConnection(freelancer.id);
+    expect(testOk.ok).toBe(true);
+    expect(testOk.status).toBe('connected');
+
+    // Expired token is accurately detected on test
+    const expiredFl = connectPlatformAccount(freelancer.id, {
+      connectionMethod: 'official_oauth',
+      credentialSecret: secretToken,
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    });
+    expect(expiredFl.status).toBe('expired');
+    const testExpired = await testPlatformConnection(freelancer.id);
+    expect(testExpired.ok).toBe(false);
+    expect(testExpired.status).toBe('expired');
+
+    // Disconnect immediately wipes stored encrypted credentials
+    const disconnectedFl = disconnectPlatformAccount(freelancer.id);
+    expect(disconnectedFl.hasStoredCredentials).toBe(false);
+    expect(disconnectedFl.status).toBe('not_connected');
+    const rawAfter = db
+      .prepare('SELECT encrypted_credentials FROM platform_accounts WHERE id = ?')
+      .get(freelancer.id) as { encrypted_credentials: string | null };
+    expect(rawAfter.encrypted_credentials).toBeNull();
+
+    // Custom extensible adapter creation + activity logs (sanitized of secret keys)
+    const custom = createCustomPlatformAdapter({
+      platformName: 'Malt Europe',
+      integrationMode: 'MODE_C_MANUAL_ASSISTANCE',
+      profileUrl: 'https://www.malt.com',
+    });
+    expect(custom.platformKey).toBe('malt_europe');
+    const logs = listPlatformActivityLogs(freelancer.id, 20);
+    expect(logs.length).toBeGreaterThanOrEqual(3);
+    expect(JSON.stringify(logs)).not.toContain(secretToken);
+
+    // Clean up custom test adapter
+    db.prepare('DELETE FROM platform_accounts WHERE id = ?').run(custom.id);
+  });
+
+  it('19. RemoteOK public API connector registration, normalization, filtering & deduplication', () => {
+    const db = getDb();
+    const src = db.prepare('SELECT * FROM sources WHERE id = ?').get('remoteok_public') as Record<string, unknown>;
+    expect(src).toBeTruthy();
+    expect(src.connector_type).toBe('public_api');
+    expect(src.implementation_status).toBe('functional');
+
+    const mockPayload = [
+      { legal: 'RemoteOK API legal notice' },
+      {
+        id: 'rok-99101',
+        slug: 'remote-typescript-automation-engineer',
+        company: 'Northwind Automation',
+        position: 'TypeScript Automation Engineer',
+        tags: ['typescript', 'nodejs', 'automation'],
+        location: 'Worldwide',
+        salary_min: 4500,
+        salary_max: 6000,
+        description: '<p>Build Node.js data pipeline and CSV automation tools.</p>',
+        url: 'https://remoteok.com/remote-jobs/remote-typescript-automation-engineer',
+        epoch: 1764000000,
+      },
+      {
+        id: 'rok-99102',
+        slug: 'logo-designer-photoshop',
+        company: 'Design Studio',
+        position: 'Graphic Designer Photoshop',
+        tags: ['photoshop'],
+        description: '<p>Create brand logos.</p>',
+      },
+    ];
+
+    const normalized = normalizeRemoteOkPayload(mockPayload, 'typescript', 10);
+    expect(normalized).toHaveLength(1);
+    expect(normalized[0].sourceId).toBe('remoteok_public');
+    expect(normalized[0].sourceName).toBe('RemoteOK');
+    expect(normalized[0].budget).toBe(6000);
+    expect(normalized[0].skills).toContain('typescript');
+
+    const firstImport = importNormalizedJob(normalized[0]);
+    expect(firstImport.imported).toBe(true);
+    const secondImport = importNormalizedJob(normalized[0]);
+    expect(secondImport.duplicate).toBe(true);
+    expect(secondImport.jobId).toBe(firstImport.jobId);
+  });
+
+  it('20. Autonomy Levels (1-5), invariant safety guardrails & Approval Queue workflow', async () => {
+    const prevAutonomy = getAutonomyConfig();
+    try {
+      // Even at Level 5, paid bids, contract acceptance & CAPTCHA pause remain enforced
+      const updated = updateAutonomyConfig({
+        level: 5,
+        maxDailyApplications: 15,
+        maxBidAmountUsd: 1200,
+        requireApprovalForPaidBids: false,
+        requireApprovalForContractAcceptance: false,
+        pauseOnCaptchaOrMfa: false,
+      });
+      expect(updated.level).toBe(5);
+      expect(updated.requireApprovalForPaidBids).toBe(true);
+      expect(updated.requireApprovalForContractAcceptance).toBe(true);
+      expect(updated.pauseOnCaptchaOrMfa).toBe(true);
+
+      // Approval queue API end-to-end
+      const req = createApprovalRequest({
+        actionType: 'paid_bid',
+        title: 'Submit Paid Bid on Freelancer.com',
+        description: 'Requires operator confirmation before spending bid credits.',
+        riskLevel: 'high',
+        platformKey: 'freelancer',
+        estimatedCostUsd: 12,
+      });
+      expect(req.status).toBe('pending');
+      expect(listApprovals('pending').some((a) => a.id === req.id)).toBe(true);
+
+      const decideRes = await fetch(`${baseUrl}/api/approvals/${req.id}/decide`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ decision: 'approved', decisionNote: 'Verified budget and scope' }),
+      });
+      expect(decideRes.status).toBe(200);
+      const decidedBody = (await decideRes.json()) as { approval: { status: string; decisionNote: string } };
+      expect(decidedBody.approval.status).toBe('approved');
+      expect(decidedBody.approval.decisionNote).toBe('Verified budget and scope');
+
+      // Revocation works cleanly
+      const revoked = decideApproval(req.id, 'revoked', 'Scope changed by client');
+      expect(revoked.status).toBe('revoked');
+    } finally {
+      updateAutonomyConfig(prevAutonomy);
+    }
+  });
+
+  it('21. Delivery Center & Reports: clean manifest, secret-leak block, approval gate, report export, diagnostics endpoint & Windows diagnostics scripts', async () => {
+    const job = importNormalizedJob({
+      sourceId: 'upwork',
+      sourceName: 'Upwork',
+      title: 'Quarterly Sales Spreadsheet & Executive Summary Report',
+      description:
+        'Clean sales dataset into CSV and deliver a concise executive summary Markdown report for Upwork client.',
+      budget: 450,
+      currency: 'USD',
+      paymentType: 'fixed',
+      skills: ['CSV', 'Data Cleaning', 'Technical Writing'],
+    });
+    const projApproval = approveJobIntoProject(job.jobId);
+    const pid = projApproval.project.id;
+    createdProjectIds.push(pid);
+
+    initProjectWorkspace(pid);
+    getDb()
+      .prepare(`UPDATE projects SET execution_mode = 'ai_generated', degraded_reason = NULL WHERE id = ?`)
+      .run(pid);
+    writeWorkspaceTextFile(pid, 'plan.md', '# Internal AI Plan (must be excluded from client delivery)', false);
+    writeWorkspaceTextFile(
+      pid,
+      'project_plan.md',
+      '# Plan: Quarterly Sales Spreadsheet & Executive Summary Report\nClean sales dataset into CSV and deliver executive summary Markdown report.',
+      false,
+    );
+    writeWorkspaceTextFile(
+      pid,
+      'submission_message.md',
+      'Hello, please find attached the verified CSV dataset and executive summary report.',
+      false,
+    );
+    writeWorkspaceTextFile(
+      pid,
+      'deliverables/executive_summary.md',
+      '# Quarterly Sales Executive Summary\n\nCleaned CSV sales dataset verified with zero duplicate records and clear technical writing.',
+      true,
+    );
+    generateCsvDeliverable(pid, 'sales_cleaned.csv', [
+      ['Quarter', 'Region', 'RevenueUSD'],
+      ['Q1', 'NA', '125000'],
+      ['Q2', 'EMEA', '142500'],
+    ]);
+
+    const qa = evaluateProjectQa(pid, 1);
+    expect(qa.score).toBeGreaterThanOrEqual(70);
+
+    // Prepare delivery package -> verifies internal logs excluded, ZIP built, approval requested
+    const prepared = await prepareDeliveryPackage(pid, {
+      submissionMethod: 'manual_upload',
+      submissionMessage: 'Attached is your completed quarterly sales CSV and executive summary package.',
+    });
+    expect(prepared.manifest).toBeTruthy();
+    expect(prepared.manifest!.secretsScanPassed).toBe(true);
+    expect(prepared.manifest!.internalLogsExcluded).toBe(true);
+    expect(prepared.manifest!.excludedInternalFiles).toContain('plan.md');
+    expect(prepared.manifest!.includedFiles.length).toBe(2);
+    expect(prepared.packageZipPath).toBeTruthy();
+    expect(prepared.status).toBe('awaiting_approval');
+    expect(prepared.approvalId).toBeTruthy();
+
+    // Attempting to submit BEFORE operator approves is blocked
+    const blockedBeforeApproval = submitDelivery(pid, { confirmedManualUpload: true });
+    expect(blockedBeforeApproval.ok).toBe(false);
+    expect(blockedBeforeApproval.status).toBe('awaiting_approval');
+
+    // Approve delivery in approval queue
+    decideApproval(prepared.approvalId!, 'approved', 'Reviewed deliverables and QA report');
+
+    // Attempting official_api submission on Upwork (prohibited by policy) safely falls back to needs_manual_action
+    const blockedApiSubmit = submitDelivery(pid, { submissionMethod: 'official_api' });
+    expect(blockedApiSubmit.ok).toBe(false);
+    expect(blockedApiSubmit.status).toBe('needs_manual_action');
+
+    // Guided manual upload confirmation succeeds with external reference & timestamp
+    const submitted = submitDelivery(pid, {
+      submissionMethod: 'manual_upload',
+      externalReference: 'UPW-MILESTONE-7742',
+      confirmationNote: 'Uploaded verified ZIP on Upwork contract milestone #1',
+      confirmedManualUpload: true,
+    });
+    expect(submitted.ok).toBe(true);
+    expect(submitted.status).toBe('submitted');
+    expect(submitted.delivery.externalReference).toBe('UPW-MILESTONE-7742');
+    expect(submitted.delivery.submittedAt).toBeTruthy();
+
+    // Delivery Report generation & Markdown/JSON export endpoints
+    const report = buildDeliveryReport(pid);
+    expect(report.externalReference).toBe('UPW-MILESTONE-7742');
+    expect(report.secretsScanPassed).toBe(true);
+    const md = formatDeliveryReportMarkdown(report);
+    expect(md).toContain('UPW-MILESTONE-7742');
+    expect(md).toContain('sales_cleaned.csv');
+
+    const exportRes = await fetch(`${baseUrl}/api/deliveries/${pid}/report/export?format=json`, {
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    expect(exportRes.status).toBe(200);
+    const exportedJson = (await exportRes.json()) as { deliveryId: string; deliveryStatus: string };
+    expect(exportedJson.deliveryId).toBe(prepared.id);
+    expect(exportedJson.deliveryStatus).toBe('submitted');
+
+    // Full Diagnostics API endpoint
+    const diagRes = await fetch(`${baseUrl}/api/diagnostics/full`, {
+      headers: { Authorization: `Bearer ${authToken}` },
+    });
+    expect(diagRes.status).toBe(200);
+    const diagBody = (await diagRes.json()) as {
+      status: string;
+      database: { schemaVersion: number };
+      platformAccounts: unknown[];
+      jobConnectors: Array<{ id: string }>;
+    };
+    expect(diagBody.status).toBe('ok');
+    expect(diagBody.database.schemaVersion).toBeGreaterThanOrEqual(4);
+    expect(diagBody.platformAccounts.length).toBeGreaterThanOrEqual(10);
+    expect(diagBody.jobConnectors.some((c) => c.id === 'remoteok_public')).toBe(true);
+
+    // Windows diagnostics.ps1 & diagnostics.cmd script contract
+    const repoRoot = process.cwd();
+    const diagPs1 = fs.readFileSync(path.join(repoRoot, 'scripts', 'diagnostics.ps1'), 'utf8');
+    const diagCmd = fs.readFileSync(path.join(repoRoot, 'scripts', 'diagnostics.cmd'), 'utf8');
+    expect(diagPs1).toContain('Get-HubEffectiveConfig');
+    expect(diagPs1).toContain('PRAGMA integrity_check');
+    expect(diagPs1).toContain('127.0.0.1:31415/v1');
+    expect(diagCmd).toContain('-ExecutionPolicy Bypass');
+    expect(diagCmd).toContain('diagnostics.ps1');
   });
 });

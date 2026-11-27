@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import express, { type Router } from 'express';
@@ -23,8 +24,10 @@ import {
   verifySessionToken,
   verifySetupToken,
 } from './security.ts';
+import { AiProviderError } from './services/aiEndpointPolicy.ts';
 import {
   checkProviderHealth,
+  deleteAiProvider,
   listAiProviders,
   testProviderCompletion,
   upsertAiProvider,
@@ -70,6 +73,31 @@ import {
   previewWorkspaceFile,
   writeWorkspaceTextFile,
 } from './services/workspaceService.ts';
+import {
+  connectPlatformAccount,
+  createCustomPlatformAdapter,
+  disconnectPlatformAccount,
+  listPlatformAccounts,
+  listPlatformActivityLogs,
+  testPlatformConnection,
+  updatePlatformAccountPolicy,
+} from './services/platformAccountsService.ts';
+import {
+  AUTONOMY_LEVEL_DESCRIPTIONS,
+  createApprovalRequest,
+  decideApproval,
+  getAutonomyConfig,
+  listApprovals,
+  updateAutonomyConfig,
+} from './services/autonomyService.ts';
+import {
+  buildDeliveryReport,
+  formatDeliveryReportMarkdown,
+  listDeliveryRecords,
+  prepareDeliveryPackage,
+  submitDelivery,
+  updateDeliveryRecord,
+} from './services/deliveryService.ts';
 import { AGENT_ROSTER, type HubSettings } from '../shared/types.ts';
 
 function isAuthClaimed(): { claimed: boolean; envOverride: boolean } {
@@ -1052,52 +1080,126 @@ export function createApiRouter(): Router {
   });
 
   // 12. AI Providers & Model Routing
+  const aiProviderPayloadSchema = z.object({
+    name: z.string().trim().min(1).max(120),
+    providerType: z.enum(['ollama', 'openai_compatible', 'freellmapi', 'gemini']),
+    apiUrl: z.string().trim().min(1).max(500),
+    apiKey: z.string().max(400).optional(),
+    clearApiKey: z.boolean().optional(),
+    model: z
+      .string()
+      .trim()
+      .max(120)
+      .optional()
+      .default('auto'),
+    contextLimit: z.number().int().min(1024).max(2000000).default(16384),
+    timeoutMs: z.number().int().min(3000).max(300000).default(60000),
+    priority: z.number().int().min(1).max(20).default(5),
+    role: z.enum(['primary', 'fallback', 'specialized']).default('fallback'),
+    enabled: z.boolean().default(true),
+  });
+
   router.get('/ai-providers', (_req, res) => {
     res.json({ providers: listAiProviders() });
   });
 
-  router.put('/ai-providers/:id', (req, res) => {
-    const schema = z.object({
-      name: z.string().min(1).max(120),
-      providerType: z.enum(['ollama', 'openai_compatible', 'freellmapi', 'gemini']),
-      apiUrl: z.string().url(),
-      apiKey: z.string().max(400).optional(),
-      model: z.string().min(1).max(120),
-      contextLimit: z.number().int().min(1024).max(2000000).default(8192),
-      timeoutMs: z.number().int().min(3000).max(300000).default(60000),
-      priority: z.number().int().min(1).max(20).default(1),
-      role: z.enum(['primary', 'fallback', 'specialized']).default('fallback'),
-      enabled: z.boolean(),
-    });
-    const parsed = schema.safeParse(req.body);
+  router.post('/ai-providers', (req, res) => {
+    const parsed = aiProviderPayloadSchema.safeParse(req.body);
     if (!parsed.success) {
-      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid provider configuration' });
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid provider configuration',
+        errorCode: 'invalid_endpoint',
+      });
+      return;
+    }
+    if (parsed.data.providerType === 'gemini') {
+      res.status(400).json({
+        error: 'Gemini is managed via the built-in server fallback provider and server GEMINI_API_KEY.',
+        errorCode: 'invalid_endpoint',
+      });
       return;
     }
     try {
-      const provider = upsertAiProvider({ id: req.params.id, ...parsed.data });
+      const requestedId = typeof req.body?.id === 'string' ? req.body.id.trim() : '';
+      const id =
+        requestedId && /^[a-zA-Z0-9_-]{2,64}$/.test(requestedId)
+          ? requestedId
+          : `provider_${crypto.randomUUID().slice(0, 8)}`;
+      const provider = upsertAiProvider({ id, ...parsed.data });
+      res.status(201).json({ provider });
+    } catch (err) {
+      const errorCode = err instanceof AiProviderError ? err.code : 'invalid_endpoint';
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Failed to create AI provider',
+        errorCode,
+      });
+    }
+  });
+
+  router.put('/ai-providers/:id', (req, res) => {
+    const providerId = req.params.id.trim();
+    if (!/^[a-zA-Z0-9_-]{2,64}$/.test(providerId)) {
+      res.status(400).json({ error: 'Invalid provider ID format', errorCode: 'invalid_endpoint' });
+      return;
+    }
+    const parsed = aiProviderPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid provider configuration',
+        errorCode: 'invalid_endpoint',
+      });
+      return;
+    }
+    try {
+      const provider = upsertAiProvider({ id: providerId, ...parsed.data });
       res.json({ provider });
     } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update AI provider' });
+      const errorCode = err instanceof AiProviderError ? err.code : 'invalid_endpoint';
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Failed to update AI provider',
+        errorCode,
+      });
+    }
+  });
+
+  router.delete('/ai-providers/:id', (req, res) => {
+    try {
+      const result = deleteAiProvider(req.params.id.trim());
+      res.json(result);
+    } catch (err) {
+      const errorCode = err instanceof AiProviderError ? err.code : 'invalid_endpoint';
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Failed to delete AI provider',
+        errorCode,
+      });
     }
   });
 
   router.post('/ai-providers/:id/health', async (req, res) => {
     try {
-      const result = await checkProviderHealth(req.params.id);
+      const result = await checkProviderHealth(req.params.id.trim());
       res.json(result);
     } catch (err) {
-      res.status(400).json({ error: err instanceof Error ? err.message : 'Health check failed' });
+      const errorCode = err instanceof AiProviderError ? err.code : 'server_error';
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Health check failed',
+        errorCode,
+      });
     }
   });
 
   router.post('/ai-providers/:id/test', async (req, res) => {
     try {
       const prompt = typeof req.body?.prompt === 'string' ? req.body.prompt : undefined;
-      const result = await testProviderCompletion(req.params.id, prompt);
+      const result = await testProviderCompletion(req.params.id.trim(), prompt);
       res.json({ ok: true, result });
     } catch (err) {
-      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : 'Model test failed' });
+      const errorCode = err instanceof AiProviderError ? err.code : 'server_error';
+      res.status(400).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Model test failed',
+        errorCode,
+      });
     }
   });
 
@@ -1270,6 +1372,412 @@ export function createApiRouter(): Router {
         details: JSON.parse(String(l.details_json || '{}')),
         createdAt: String(l.created_at),
       })),
+    });
+  });
+
+  // 17. Platform Accounts Center & Capability/Policy Engine
+  router.get('/platform-accounts', (_req, res) => {
+    res.json({ accounts: listPlatformAccounts() });
+  });
+
+  router.post('/platform-accounts', (req, res) => {
+    const schema = z.object({
+      platformName: z.string().trim().min(2).max(80),
+      platformKey: z.string().trim().max(48).optional(),
+      category: z.enum(['freelance_marketplace', 'remote_job_board', 'custom_adapter']).optional(),
+      integrationMode: z
+        .enum([
+          'MODE_A_OFFICIAL_API',
+          'MODE_B_PERMITTED_BROWSER',
+          'MODE_C_MANUAL_ASSISTANCE',
+          'MODE_D_PUBLIC_SOURCE',
+        ])
+        .optional(),
+      connectionMethod: z
+        .enum([
+          'official_oauth',
+          'official_api_key',
+          'permitted_browser_session',
+          'manual_browser_assisted',
+          'manual_import',
+          'public_api',
+        ])
+        .optional(),
+      profileUrl: z.string().trim().max(400).optional(),
+      policySummary: z.string().trim().max(800).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid platform adapter payload' });
+      return;
+    }
+    try {
+      const account = createCustomPlatformAdapter(parsed.data);
+      res.status(201).json({ account });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to create platform adapter' });
+    }
+  });
+
+  router.patch('/platform-accounts/:id', (req, res) => {
+    const schema = z.object({
+      enabled: z.boolean().optional(),
+      integrationMode: z
+        .enum([
+          'MODE_A_OFFICIAL_API',
+          'MODE_B_PERMITTED_BROWSER',
+          'MODE_C_MANUAL_ASSISTANCE',
+          'MODE_D_PUBLIC_SOURCE',
+        ])
+        .optional(),
+      connectionMethod: z
+        .enum([
+          'official_oauth',
+          'official_api_key',
+          'permitted_browser_session',
+          'manual_browser_assisted',
+          'manual_import',
+          'public_api',
+        ])
+        .optional(),
+      accountIdentifier: z.string().max(180).nullable().optional(),
+      displayName: z.string().max(120).nullable().optional(),
+      profileUrl: z.string().max(400).nullable().optional(),
+      capabilities: z.record(z.string(), z.boolean()).optional(),
+      permissions: z
+        .object({
+          allowDrafting: z.boolean().optional(),
+          allowManualHandoff: z.boolean().optional(),
+          allowOfficialApiCalls: z.boolean().optional(),
+          requireApprovalBeforeExternalAction: z.boolean().optional(),
+        })
+        .optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid platform policy update' });
+      return;
+    }
+    try {
+      const account = updatePlatformAccountPolicy(req.params.id, parsed.data);
+      res.json({ account });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Failed to update platform account' });
+    }
+  });
+
+  router.post('/platform-accounts/:id/connect', (req, res) => {
+    const schema = z.object({
+      connectionMethod: z.enum([
+        'official_oauth',
+        'official_api_key',
+        'permitted_browser_session',
+        'manual_browser_assisted',
+        'manual_import',
+        'public_api',
+      ]),
+      accountIdentifier: z.string().max(180).optional(),
+      displayName: z.string().max(120).optional(),
+      profileUrl: z.string().max(400).optional(),
+      credentialSecret: z.string().max(2000).optional(),
+      credentialScope: z.string().max(250).optional(),
+      expiresAt: z.string().max(80).nullable().optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid connect payload' });
+      return;
+    }
+    try {
+      const account = connectPlatformAccount(req.params.id, parsed.data);
+      res.json({ account });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Platform connection failed' });
+    }
+  });
+
+  router.post('/platform-accounts/:id/test', async (req, res) => {
+    try {
+      const result = await testPlatformConnection(req.params.id);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : 'Connection test failed' });
+    }
+  });
+
+  router.post('/platform-accounts/:id/disconnect', (req, res) => {
+    try {
+      const account = disconnectPlatformAccount(req.params.id);
+      res.json({ account });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Disconnect failed' });
+    }
+  });
+
+  router.get('/platform-accounts/:id/logs', (req, res) => {
+    res.json({ logs: listPlatformActivityLogs(req.params.id, 50) });
+  });
+
+  // 18. Autonomy Levels (1-5) & Human Approval Queue
+  router.get('/autonomy', (_req, res) => {
+    res.json({
+      config: getAutonomyConfig(),
+      levels: AUTONOMY_LEVEL_DESCRIPTIONS,
+    });
+  });
+
+  router.put('/autonomy', (req, res) => {
+    const schema = z.object({
+      level: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4), z.literal(5)]).optional(),
+      maxDailyApplications: z.number().int().min(0).max(200).optional(),
+      maxBidAmountUsd: z.number().min(0).max(100000).optional(),
+      maxDailySpendUsd: z.number().min(0).max(10000).optional(),
+      requireApprovalForPaidBids: z.boolean().optional(),
+      requireApprovalForContractAcceptance: z.boolean().optional(),
+      requireApprovalForFinalDelivery: z.boolean().optional(),
+      requireApprovalForClientMessages: z.boolean().optional(),
+      requireApprovalForExternalUploads: z.boolean().optional(),
+      pauseOnPolicyWarning: z.boolean().optional(),
+      pauseOnCaptchaOrMfa: z.boolean().optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid autonomy configuration' });
+      return;
+    }
+    res.json({ config: updateAutonomyConfig(parsed.data), levels: AUTONOMY_LEVEL_DESCRIPTIONS });
+  });
+
+  router.get('/approvals', (req, res) => {
+    const status = typeof req.query.status === 'string' ? req.query.status : 'all';
+    res.json({
+      approvals: listApprovals(status as 'all' | 'pending' | 'approved' | 'rejected' | 'revoked' | 'expired'),
+    });
+  });
+
+  router.post('/approvals', (req, res) => {
+    const schema = z.object({
+      actionType: z.enum([
+        'final_delivery_submission',
+        'application_submission',
+        'paid_bid',
+        'contract_acceptance',
+        'client_message',
+        'external_upload',
+        'platform_account_change',
+        'project_start',
+      ]),
+      title: z.string().trim().min(3).max(180),
+      description: z.string().trim().min(3).max(1500),
+      riskLevel: z.enum(['low', 'medium', 'high', 'critical']).optional(),
+      relatedEntityType: z.string().max(60).nullable().optional(),
+      relatedEntityId: z.string().max(80).nullable().optional(),
+      platformKey: z.string().max(60).nullable().optional(),
+      estimatedCostUsd: z.number().min(0).max(1000000).nullable().optional(),
+      payload: z.record(z.string(), z.unknown()).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid approval request' });
+      return;
+    }
+    const approval = createApprovalRequest({ ...parsed.data, requestedBy: 'operator' });
+    res.status(201).json({ approval });
+  });
+
+  router.post('/approvals/:id/decide', (req, res) => {
+    const schema = z.object({
+      decision: z.enum(['approved', 'rejected', 'revoked']),
+      decisionNote: z.string().max(1000).optional(),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Valid decision (approved, rejected, revoked) is required' });
+      return;
+    }
+    try {
+      const approval = decideApproval(req.params.id, parsed.data.decision, parsed.data.decisionNote);
+      res.json({ approval });
+    } catch (err) {
+      res.status(404).json({ error: err instanceof Error ? err.message : 'Approval not found' });
+    }
+  });
+
+  // 19. Delivery Center & Delivery Reports
+  router.get('/deliveries', (req, res) => {
+    const search = typeof req.query.search === 'string' ? req.query.search : '';
+    const status = typeof req.query.status === 'string' ? req.query.status : 'all';
+    res.json({ deliveries: listDeliveryRecords(search, status) });
+  });
+
+  router.post('/deliveries/:projectId/prepare', async (req, res) => {
+    const schema = z.object({
+      submissionMethod: z
+        .enum(['official_api', 'authorized_upload', 'manual_upload', 'guided_browser_workflow'])
+        .optional(),
+      submissionMessage: z.string().max(12000).optional(),
+      deliverySummary: z.string().max(8000).optional(),
+    });
+    const parsed = schema.safeParse(req.body || {});
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid delivery preparation payload' });
+      return;
+    }
+    try {
+      const delivery = await prepareDeliveryPackage(req.params.projectId, parsed.data);
+      res.json({ delivery });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Delivery preparation failed' });
+    }
+  });
+
+  router.post('/deliveries/:projectId/submit', (req, res) => {
+    const schema = z.object({
+      submissionMethod: z
+        .enum(['official_api', 'authorized_upload', 'manual_upload', 'guided_browser_workflow'])
+        .optional(),
+      externalReference: z.string().max(240).optional(),
+      confirmationNote: z.string().max(2000).optional(),
+      markDelivered: z.boolean().optional(),
+      confirmedManualUpload: z.boolean().optional(),
+    });
+    const parsed = schema.safeParse(req.body || {});
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid delivery submission payload' });
+      return;
+    }
+    try {
+      const result = submitDelivery(req.params.projectId, parsed.data);
+      res.json(result);
+    } catch (err) {
+      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : 'Delivery submission failed' });
+    }
+  });
+
+  router.patch('/deliveries/:projectId', (req, res) => {
+    const schema = z.object({
+      status: z
+        .enum([
+          'not_ready',
+          'preparing',
+          'qa_pending',
+          'ready_for_delivery',
+          'awaiting_approval',
+          'delivery_in_progress',
+          'submitted',
+          'submission_unverified',
+          'delivered',
+          'failed',
+          'needs_manual_action',
+        ])
+        .optional(),
+      submissionMethod: z
+        .enum(['official_api', 'authorized_upload', 'manual_upload', 'guided_browser_workflow'])
+        .optional(),
+      externalReference: z.string().max(240).nullable().optional(),
+      confirmationNote: z.string().max(2000).nullable().optional(),
+      submissionMessage: z.string().max(12000).nullable().optional(),
+    });
+    const parsed = schema.safeParse(req.body || {});
+    if (!parsed.success) {
+      res.status(400).json({ error: 'Invalid delivery update payload' });
+      return;
+    }
+    try {
+      const delivery = updateDeliveryRecord(req.params.projectId, parsed.data);
+      res.json({ delivery });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Delivery update failed' });
+    }
+  });
+
+  router.get('/deliveries/:projectId/report', (req, res) => {
+    try {
+      const report = buildDeliveryReport(req.params.projectId);
+      res.json({ report, markdown: formatDeliveryReportMarkdown(report) });
+    } catch (err) {
+      res.status(404).json({ error: err instanceof Error ? err.message : 'Delivery report not found' });
+    }
+  });
+
+  router.get('/deliveries/:projectId/report/export', (req, res) => {
+    try {
+      const report = buildDeliveryReport(req.params.projectId);
+      const format = req.query.format === 'json' ? 'json' : 'markdown';
+      const safeName = sanitizePathSegment(`delivery_report_${req.params.projectId}`);
+      if (format === 'json') {
+        res.setHeader('Content-Type', 'application/json; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}.json"`);
+        res.send(JSON.stringify(report, null, 2));
+      } else {
+        res.setHeader('Content-Type', 'text/markdown; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="${safeName}.md"`);
+        res.send(formatDeliveryReportMarkdown(report));
+      }
+    } catch (err) {
+      res.status(404).json({ error: err instanceof Error ? err.message : 'Report export failed' });
+    }
+  });
+
+  // 20. Full System Diagnostics (used by Windows diagnostics.ps1 and UI)
+  router.get('/diagnostics/full', (_req, res) => {
+    const db = getDb();
+    const migrations = db
+      .prepare('SELECT version, name, applied_at FROM schema_migrations ORDER BY version ASC')
+      .all() as Array<{ version: number; name: string; applied_at: string }>;
+    const workspaceExists = fs.existsSync(CONFIG.workspaceDir);
+    const dbExists = CONFIG.dbPath === ':memory:' ? true : fs.existsSync(CONFIG.dbPath);
+
+    res.json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      runtime: {
+        nodeVersion: process.version,
+        platform: process.platform,
+        host: CONFIG.host,
+        port: CONFIG.port,
+      },
+      database: {
+        path: CONFIG.dbPath,
+        exists: dbExists,
+        schemaVersion: migrations[migrations.length - 1]?.version || 0,
+        migrations,
+      },
+      workspace: {
+        path: CONFIG.workspaceDir,
+        exists: workspaceExists,
+      },
+      encryption: getEncryptionKeyInfo(),
+      aiProviders: listAiProviders().map((p) => ({
+        id: p.id,
+        name: p.name,
+        providerType: p.providerType,
+        apiUrl: p.apiUrl,
+        model: p.model,
+        enabled: p.enabled,
+        lastStatus: p.lastStatus,
+        lastErrorCode: p.lastErrorCode || null,
+      })),
+      jobConnectors: listSources().map((s) => ({
+        id: s.id,
+        name: s.name,
+        connectorType: s.connectorType,
+        implementationStatus: s.implementationStatus,
+        enabled: s.enabled,
+        connectionStatus: s.connectionStatus,
+      })),
+      platformAccounts: listPlatformAccounts().map((a) => ({
+        id: a.id,
+        platformKey: a.platformKey,
+        platformName: a.platformName,
+        status: a.status,
+        integrationMode: a.integrationMode,
+        enabled: a.enabled,
+      })),
+      autonomy: getAutonomyConfig(),
+      pendingApprovals: listApprovals('pending').length,
+      deliveries: listDeliveryRecords().length,
+      resources: getResourceSnapshot(),
     });
   });
 

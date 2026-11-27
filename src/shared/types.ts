@@ -4,11 +4,15 @@ export type NavSection =
   | 'job-details'
   | 'proposals'
   | 'agents'
+  | 'projects'
   | 'workspace'
   | 'qa'
   | 'submissions'
-  | 'analytics'
+  | 'platform-accounts'
+  | 'ai-providers'
+  | 'automation'
   | 'tasks'
+  | 'analytics'
   | 'sources'
   | 'settings';
 
@@ -327,10 +331,21 @@ export interface PaymentRecord {
   createdAt: string;
 }
 
+export type AiProviderType = 'ollama' | 'openai_compatible' | 'freellmapi' | 'gemini';
+
+export type AiProviderErrorCode =
+  | 'invalid_endpoint'
+  | 'blocked_endpoint'
+  | 'auth_failure'
+  | 'connection_refused'
+  | 'timeout'
+  | 'invalid_model'
+  | 'server_error';
+
 export interface AiProviderRecord {
   id: string;
   name: string;
-  providerType: 'ollama' | 'openai_compatible' | 'freellmapi' | 'gemini';
+  providerType: AiProviderType;
   apiUrl: string;
   hasApiKey: boolean;
   model: string;
@@ -342,6 +357,7 @@ export interface AiProviderRecord {
   lastStatus: 'online' | 'offline' | 'unconfigured' | 'error' | 'unknown';
   lastCheckedAt: string | null;
   lastError: string | null;
+  lastErrorCode?: AiProviderErrorCode | null;
   availableModels?: string[];
 }
 
@@ -405,12 +421,333 @@ export interface SchedulerConfig {
   autoAnalyzeImported: boolean;
 }
 
+export type PlatformAccountStatus =
+  | 'not_connected'
+  | 'connecting'
+  | 'connected'
+  | 'expired'
+  | 'needs_verification'
+  | 'requires_manual_login'
+  | 'api_unavailable'
+  | 'disabled'
+  | 'error';
+
+export type PlatformVerificationStatus =
+  | 'not_connected'
+  | 'credential_stored'
+  | 'credential_encryption_verified'
+  | 'live_verification_pending'
+  | 'live_verification_successful'
+  | 'live_verification_failed'
+  | 'authentication_expired'
+  | 'authentication_revoked'
+  | 'insufficient_permissions'
+  | 'api_unavailable'
+  | 'manual_verification_required';
+
+export type PlatformConnectionMethod =
+  | 'official_oauth'
+  | 'official_api_key'
+  | 'permitted_browser_session'
+  | 'manual_browser_assisted'
+  | 'manual_import'
+  | 'public_api';
+
+export type PlatformIntegrationMode =
+  | 'MODE_A_OFFICIAL_API'
+  | 'MODE_B_PERMITTED_BROWSER'
+  | 'MODE_C_MANUAL_ASSISTANCE'
+  | 'MODE_D_PUBLIC_SOURCE';
+
+export interface PlatformCapabilities {
+  publicJobDiscovery: boolean;
+  authenticatedJobDiscovery: boolean;
+  jobDetails: boolean;
+  search: boolean;
+  applicationDrafting: boolean;
+  applicationSubmission: boolean;
+  messaging: boolean;
+  fileUploads: boolean;
+  deliverableSubmission: boolean;
+  applicationStatusTracking: boolean;
+  clientFeedbackRetrieval: boolean;
+  contractStatus: boolean;
+  apiAvailability: boolean;
+  browserInteractionPermitted: boolean;
+}
+
+export interface PlatformAccountRecord {
+  id: string;
+  platformKey: string;
+  platformName: string;
+  category: 'freelance_marketplace' | 'remote_job_board' | 'custom_adapter';
+  status: PlatformAccountStatus;
+  verificationStatus: PlatformVerificationStatus;
+  verificationDetail: string | null;
+  connectionMethod: PlatformConnectionMethod;
+  integrationMode: PlatformIntegrationMode;
+  supportedMethods: PlatformConnectionMethod[];
+  enabled: boolean;
+  accountIdentifier: string | null;
+  displayName: string | null;
+  profileUrl: string | null;
+  hasStoredCredentials: boolean;
+  credentialScope: string | null;
+  lastVerifiedAt: string | null;
+  expiresAt: string | null;
+  lastError: string | null;
+  policySummary: string;
+  complianceRestriction: string;
+  capabilities: PlatformCapabilities;
+  permittedCapabilities: PlatformCapabilities;
+  permissions: {
+    allowDrafting: boolean;
+    allowManualHandoff: boolean;
+    allowOfficialApiCalls: boolean;
+    requireApprovalBeforeExternalAction: boolean;
+  };
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PlatformActivityLog {
+  id: string;
+  platformId: string;
+  action: string;
+  status: 'info' | 'success' | 'warning' | 'error';
+  message: string;
+  metadata: Record<string, unknown>;
+  createdAt: string;
+}
+
+export type AutonomyLevel = 1 | 2 | 3 | 4 | 5;
+
+export interface AutonomyConfig {
+  level: AutonomyLevel;
+  maxDailyApplications: number;
+  maxBidAmountUsd: number;
+  maxDailySpendUsd: number;
+  requireApprovalForPaidBids: boolean;
+  requireApprovalForContractAcceptance: boolean;
+  requireApprovalForFinalDelivery: boolean;
+  requireApprovalForClientMessages: boolean;
+  requireApprovalForExternalUploads: boolean;
+  pauseOnPolicyWarning: boolean;
+  pauseOnCaptchaOrMfa: boolean;
+}
+
+export type ApprovalActionType =
+  | 'final_delivery_submission'
+  | 'application_submission'
+  | 'paid_bid'
+  | 'contract_acceptance'
+  | 'client_message'
+  | 'external_upload'
+  | 'platform_account_change'
+  | 'project_start';
+
+export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'revoked' | 'expired';
+
+export interface ApprovalRecord {
+  id: string;
+  actionType: ApprovalActionType;
+  title: string;
+  description: string;
+  riskLevel: 'low' | 'medium' | 'high' | 'critical';
+  status: ApprovalStatus;
+  relatedEntityType: string | null;
+  relatedEntityId: string | null;
+  platformKey: string | null;
+  estimatedCostUsd: number | null;
+  payload: Record<string, unknown>;
+  requestedBy: string;
+  decidedBy: string | null;
+  decisionNote: string | null;
+  createdAt: string;
+  decidedAt: string | null;
+}
+
+export type DeliveryStatus =
+  | 'not_ready'
+  | 'preparing'
+  | 'qa_pending'
+  | 'ready_for_delivery'
+  | 'awaiting_approval'
+  | 'delivery_in_progress'
+  | 'submission_unverified'
+  | 'submission_reported'
+  | 'submitted'
+  | 'delivered'
+  | 'accepted'
+  | 'paid'
+  | 'failed'
+  | 'needs_manual_action'
+  | 'cancelled';
+
+export type SubmissionMethod =
+  | 'official_api'
+  | 'authorized_upload'
+  | 'manual_upload'
+  | 'guided_browser_workflow';
+
+export type DeliveryEvidenceType =
+  | 'official_api_response'
+  | 'verified_upload_receipt'
+  | 'manual_self_report'
+  | 'client_receipt_confirmation'
+  | 'client_acceptance_confirmation'
+  | 'payment_confirmation'
+  | 'failure_report'
+  | 'cancellation_record';
+
+export interface DeliveryEvidenceRecord {
+  id: string;
+  deliveryId: string;
+  projectId: string;
+  evidenceType: DeliveryEvidenceType;
+  verifiedByPlatform: boolean;
+  summary: string;
+  externalReference: string | null;
+  actor: string;
+  metadata: Record<string, unknown>;
+  recordedAt: string;
+}
+
+export interface DeliveryTransitionRecord {
+  id: string;
+  deliveryId: string;
+  projectId: string;
+  fromStatus: DeliveryStatus;
+  toStatus: DeliveryStatus;
+  actor: string;
+  reason: string;
+  evidenceId: string | null;
+  recordedAt: string;
+}
+
+export interface SecretScanFinding {
+  file: string;
+  location: string;
+  category: string;
+  rule: string;
+  riskLevel: 'critical' | 'high' | 'medium' | 'low';
+  redactedMatch: string;
+  contextHint: string;
+}
+
+export interface SecretScanReport {
+  scanStatus: 'clean' | 'findings_detected' | 'partially_scanned' | 'error';
+  scannedAt: string;
+  durationMs: number;
+  timedOut: boolean;
+  filesScanned: string[];
+  formatsInspected: string[];
+  unsupportedFormats: Array<{ file: string; format: string; reason: string }>;
+  scanErrors: Array<{ file: string; error: string }>;
+  findings: SecretScanFinding[];
+  warnings: string[];
+  riskLevel: 'none' | 'low' | 'medium' | 'high' | 'critical';
+  humanReviewRequired: boolean;
+}
+
+export interface DeliveryManifestFile {
+  filename: string;
+  relativePath: string;
+  fileType: string;
+  sizeBytes: number;
+  sha256: string;
+  verified: boolean;
+}
+
+export interface DeliveryPackageManifest {
+  preparedAt: string;
+  zipRelativePath: string | null;
+  zipSha256: string | null;
+  totalFiles: number;
+  totalBytes: number;
+  includedFiles: DeliveryManifestFile[];
+  excludedInternalFiles: string[];
+  missingFiles?: string[];
+  corruptedFiles?: string[];
+  packageWarnings?: string[];
+  secretsScanPassed: boolean;
+  secretScanReport?: SecretScanReport;
+  internalLogsExcluded: boolean;
+  qaScore: number | null;
+  qaPassed: boolean;
+  humanReviewRequired?: boolean;
+}
+
+export interface DeliveryRecord {
+  id: string;
+  projectId: string;
+  jobId: string;
+  projectTitle: string;
+  platformKey: string;
+  platformName: string;
+  jobUrl: string | null;
+  status: DeliveryStatus;
+  submissionMethod: SubmissionMethod;
+  approvalId: string | null;
+  approvalStatus: ApprovalStatus | null;
+  packageZipPath: string | null;
+  manifest: DeliveryPackageManifest | null;
+  deliverySummary: string | null;
+  submissionMessage: string | null;
+  externalReference: string | null;
+  confirmationNote: string | null;
+  verificationSource: 'none' | 'manual_self_reported' | 'platform_verified';
+  submittedAt: string | null;
+  deliveredAt: string | null;
+  acceptedAt: string | null;
+  paidAt: string | null;
+  lastError: string | null;
+  evidence: DeliveryEvidenceRecord[];
+  transitions: DeliveryTransitionRecord[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DeliveryReport {
+  deliveryId: string;
+  projectId: string;
+  jobId: string;
+  projectTitle: string;
+  platformName: string;
+  clientInfo: Record<string, unknown> | null;
+  budget: number | null;
+  currency: string;
+  deliveryStatus: DeliveryStatus;
+  verificationSource: 'none' | 'manual_self_reported' | 'platform_verified';
+  submissionMethod: SubmissionMethod;
+  qaScore: number | null;
+  qaStatus: string | null;
+  approvalStatus: ApprovalStatus | null;
+  approvalDecidedAt: string | null;
+  packageZipPath: string | null;
+  deliverables: DeliveryManifestFile[];
+  excludedInternalFiles: string[];
+  secretsScanPassed: boolean;
+  secretScanReport: SecretScanReport | null;
+  submissionMessage: string | null;
+  externalReference: string | null;
+  confirmationNote: string | null;
+  evidence: DeliveryEvidenceRecord[];
+  transitions: DeliveryTransitionRecord[];
+  submittedAt: string | null;
+  deliveredAt: string | null;
+  acceptedAt: string | null;
+  paidAt: string | null;
+  generatedAt: string;
+}
+
 export interface HubSettings {
   userSkills: string[];
   scoreWeights: ScoreWeights;
   filters: FilterConfig;
   resourceLimits: ResourceLimitsConfig;
   scheduler: SchedulerConfig;
+  autonomy: AutonomyConfig;
   notifications: {
     highMatchJob: boolean;
     proposalReady: boolean;
@@ -445,6 +782,14 @@ export interface DashboardData {
     estimatedPotentialEarnings: number;
     actualPaidEarnings: number;
     netPaidEarnings: number;
+    connectedPlatforms: number;
+    totalPlatforms: number;
+    pendingApprovals: number;
+    deliveriesInProgress: number;
+    deliveriesSubmitted: number;
+    onlineProviders: number;
+    totalProviders: number;
+    autonomyLevel: AutonomyLevel;
   };
   charts: {
     discoveryOverTime: Array<{ date: string; discovered: number; shortlisted: number }>;

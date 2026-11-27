@@ -333,30 +333,70 @@ export async function generatePptxDeliverable(
   return registerDeliverable(projectId, relPath, 'PPTX', out, true);
 }
 
-export async function packageProjectDeliverablesZip(projectId: string): Promise<DeliverableRecord> {
+const BLOCKED_CLIENT_PACKAGE_PATTERNS = [
+  /^plan\.md$/i,
+  /^project_plan\.md$/i,
+  /^qa_report.*\.md$/i,
+  /^degraded_generation_notice\.md$/i,
+  /^qa_remediation_action_items\.md$/i,
+  /^agent_logs/i,
+  /^internal_/i,
+  /\.log$/i,
+  /^\.env(\..+)?$/i,
+  /^\.npmrc$/i,
+  /^\.pypirc$/i,
+  /^\.netrc$/i,
+  /^\.git-credentials$/i,
+  /\.key$/i,
+  /\.pem$/i,
+  /\.db$/i,
+  /\.sqlite3?$/i,
+  /cookies/i,
+];
+
+function isBlockedFromClientPackage(relOrName: string): boolean {
+  const normalized = relOrName.replace(/\\/g, '/');
+  const base = path.posix.basename(normalized);
+  return BLOCKED_CLIENT_PACKAGE_PATTERNS.some((rx) => rx.test(base) || rx.test(normalized));
+}
+
+export async function packageProjectDeliverablesZip(
+  projectId: string,
+  validatedRelativePaths?: string[],
+): Promise<DeliverableRecord> {
   assertToolAuthorized('create_zip');
   const deliverablesDir = resolveSafeWorkspacePath(projectId, 'deliverables');
   const zipRelPath = `deliverables/${sanitizePathSegment(projectId)}_package.zip`;
 
   const filesToPack: Array<{ buffer: Buffer; name: string }> = [];
-  if (fs.existsSync(deliverablesDir)) {
+  if (Array.isArray(validatedRelativePaths) && validatedRelativePaths.length > 0) {
+    for (const rel of validatedRelativePaths) {
+      const normalized = rel.replace(/\\/g, '/').replace(/^\/+/, '');
+      if (normalized.endsWith('.zip') || isBlockedFromClientPackage(normalized)) continue;
+      const safeRead = readSafeWorkspaceFile(projectId, normalized);
+      const archiveName = normalized.startsWith('deliverables/')
+        ? normalized.slice('deliverables/'.length)
+        : path.posix.basename(normalized);
+      filesToPack.push({ buffer: safeRead.buffer, name: archiveName });
+    }
+  } else if (fs.existsSync(deliverablesDir)) {
     for (const entry of fs.readdirSync(deliverablesDir, { withFileTypes: true })) {
       if (entry.isSymbolicLink() || !entry.isFile()) continue;
-      if (entry.name.endsWith('.zip')) continue;
+      if (entry.name.endsWith('.zip') || isBlockedFromClientPackage(entry.name)) continue;
       const safeRead = readSafeWorkspaceFile(projectId, `deliverables/${entry.name}`);
       filesToPack.push({ buffer: safeRead.buffer, name: entry.name });
     }
   }
 
-  // Also include submission_message.md & qa_report.md if present (using O_NOFOLLOW safe read)
-  for (const extra of ['submission_message.md', 'qa_report.md']) {
-    try {
-      const safeRead = readSafeWorkspaceFile(projectId, extra);
-      filesToPack.push({ buffer: safeRead.buffer, name: extra });
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
-        throw err;
-      }
+  // Include client-facing submission_message.md if present (never include internal qa_report.md or logs)
+  try {
+    const safeRead = readSafeWorkspaceFile(projectId, 'submission_message.md');
+    if (!filesToPack.some((f) => f.name === 'submission_message.md')) {
+      filesToPack.push({ buffer: safeRead.buffer, name: 'submission_message.md' });
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+      throw err;
     }
   }
 

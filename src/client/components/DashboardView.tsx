@@ -122,6 +122,60 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         </div>
       </div>
 
+      {/* Live Operations & Governance Strip */}
+      <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+        <button
+          onClick={() => onNavigate('platform-accounts')}
+          className="text-left bg-[#0B1221] hover:border-cyan-500/40 border border-slate-800/80 rounded-xl p-3.5 transition-colors"
+        >
+          <div className="text-[11px] text-slate-400 uppercase tracking-wider">Platforms Connected</div>
+          <div className="text-xl font-semibold text-emerald-400 mt-1 tabular-nums">
+            {kpis.connectedPlatforms} / {kpis.totalPlatforms}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-0.5">Public feeds & policy engine</div>
+        </button>
+        <button
+          onClick={() => onNavigate('automation')}
+          className="text-left bg-[#0B1221] hover:border-cyan-500/40 border border-slate-800/80 rounded-xl p-3.5 transition-colors"
+        >
+          <div className="text-[11px] text-slate-400 uppercase tracking-wider">Pending Approvals</div>
+          <div className={`text-xl font-semibold mt-1 tabular-nums ${kpis.pendingApprovals > 0 ? 'text-amber-400' : 'text-slate-200'}`}>
+            {kpis.pendingApprovals}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-0.5">Autonomy Level {kpis.autonomyLevel}</div>
+        </button>
+        <button
+          onClick={() => onNavigate('submissions')}
+          className="text-left bg-[#0B1221] hover:border-cyan-500/40 border border-slate-800/80 rounded-xl p-3.5 transition-colors"
+        >
+          <div className="text-[11px] text-slate-400 uppercase tracking-wider">Deliveries Queue</div>
+          <div className="text-xl font-semibold text-cyan-400 mt-1 tabular-nums">
+            {kpis.deliveriesInProgress} active · {kpis.deliveriesSubmitted} sent
+          </div>
+          <div className="text-[11px] text-slate-500 mt-0.5">Package & report tracking</div>
+        </button>
+        <button
+          onClick={() => onNavigate('ai-providers')}
+          className="text-left bg-[#0B1221] hover:border-cyan-500/40 border border-slate-800/80 rounded-xl p-3.5 transition-colors"
+        >
+          <div className="text-[11px] text-slate-400 uppercase tracking-wider">AI Providers Online</div>
+          <div className={`text-xl font-semibold mt-1 tabular-nums ${kpis.onlineProviders > 0 ? 'text-emerald-400' : 'text-amber-300'}`}>
+            {kpis.onlineProviders} / {kpis.totalProviders}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-0.5">Ollama · FreeLLMAPI · Local</div>
+        </button>
+        <button
+          onClick={() => onNavigate('analytics')}
+          className="text-left bg-[#0B1221] hover:border-cyan-500/40 border border-slate-800/80 rounded-xl p-3.5 transition-colors"
+        >
+          <div className="text-[11px] text-slate-400 uppercase tracking-wider">Verified Net Paid</div>
+          <div className="text-xl font-semibold text-emerald-400 mt-1 tabular-nums">
+            {formatMoney(kpis.netPaidEarnings)}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-0.5">View earnings analytics</div>
+        </button>
+      </div>
+
       {/* Empty State Banner (Production starts clean with zero fabricated stats) */}
       {isEmpty && (
         <div className="bg-[#0B1221] border border-cyan-500/25 rounded-xl p-6 flex flex-col md:flex-row md:items-center md:justify-between gap-4">

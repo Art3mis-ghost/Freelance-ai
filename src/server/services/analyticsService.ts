@@ -171,6 +171,37 @@ export function buildDashboardData(): DashboardData {
     };
   });
 
+  const platformStats = db
+    .prepare(
+      `SELECT
+        COUNT(*) as total_platforms,
+        SUM(CASE WHEN enabled = 1 AND status = 'connected' THEN 1 ELSE 0 END) as connected_platforms
+       FROM platform_accounts`,
+    )
+    .get() as Record<string, number | null>;
+
+  const approvalStats = db
+    .prepare(`SELECT COUNT(*) as pending_approvals FROM approvals WHERE status = 'pending'`)
+    .get() as Record<string, number | null>;
+
+  const deliveryStats = db
+    .prepare(
+      `SELECT
+        SUM(CASE WHEN status IN ('preparing', 'qa_pending', 'ready_for_delivery', 'awaiting_approval', 'delivery_in_progress', 'needs_manual_action') THEN 1 ELSE 0 END) as in_progress,
+        SUM(CASE WHEN status IN ('submitted', 'delivered') THEN 1 ELSE 0 END) as submitted
+       FROM delivery_records`,
+    )
+    .get() as Record<string, number | null>;
+
+  const providerStats = db
+    .prepare(
+      `SELECT
+        COUNT(*) as total_providers,
+        SUM(CASE WHEN enabled = 1 AND last_status = 'online' THEN 1 ELSE 0 END) as online_providers
+       FROM ai_providers`,
+    )
+    .get() as Record<string, number | null>;
+
   return {
     demoMode: settings.demoMode,
     kpis: {
@@ -189,6 +220,14 @@ export function buildDashboardData(): DashboardData {
       estimatedPotentialEarnings: Number(projStats?.est_earnings || 0),
       actualPaidEarnings: Number(payStats?.actual_paid || 0),
       netPaidEarnings: Number(payStats?.net_paid || 0),
+      connectedPlatforms: Number(platformStats?.connected_platforms || 0),
+      totalPlatforms: Number(platformStats?.total_platforms || 0),
+      pendingApprovals: Number(approvalStats?.pending_approvals || 0),
+      deliveriesInProgress: Number(deliveryStats?.in_progress || 0),
+      deliveriesSubmitted: Number(deliveryStats?.submitted || 0),
+      onlineProviders: Number(providerStats?.online_providers || 0),
+      totalProviders: Number(providerStats?.total_providers || 0),
+      autonomyLevel: settings.autonomy.level,
     },
     charts: {
       discoveryOverTime: discoveryRows.map((r) => ({

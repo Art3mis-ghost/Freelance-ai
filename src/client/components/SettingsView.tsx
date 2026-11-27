@@ -1,17 +1,42 @@
 import React, { useEffect, useState } from 'react';
-import { Save, Activity, Zap, Download, HardDrive, Terminal } from 'lucide-react';
+import { Save, Activity, Zap, Download, HardDrive, Terminal, Plus, Trash2 } from 'lucide-react';
 import { apiRequest, formatShortDate } from '../api.ts';
-import type { AiProviderRecord, HubSettings } from '../../shared/types.ts';
+import type { AiProviderErrorCode, AiProviderRecord, AiProviderType, HubSettings } from '../../shared/types.ts';
+
+const BUILTIN_PROVIDER_IDS = new Set(['ollama_local', 'freellmapi', 'openai_compat', 'gemini_fallback']);
 
 interface SettingsViewProps {
   onSettingsChanged: () => void;
+  initialTab?: 'providers' | 'scoring' | 'filters' | 'resources' | 'system';
 }
 
-export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged }) => {
-  const [tab, setTab] = useState<'providers' | 'scoring' | 'filters' | 'resources' | 'system'>('providers');
+export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged, initialTab = 'providers' }) => {
+  const [tab, setTab] = useState<'providers' | 'scoring' | 'filters' | 'resources' | 'system'>(initialTab);
+
+  useEffect(() => {
+    setTab(initialTab);
+  }, [initialTab]);
   const [settings, setSettings] = useState<HubSettings | null>(null);
   const [providers, setProviders] = useState<AiProviderRecord[]>([]);
   const [apiKeysDraft, setApiKeysDraft] = useState<Record<string, string>>({});
+  const [showAddProvider, setShowAddProvider] = useState(false);
+  const [newProvider, setNewProvider] = useState<{
+    name: string;
+    providerType: Exclude<AiProviderType, 'gemini'>;
+    apiUrl: string;
+    model: string;
+    apiKey: string;
+    priority: number;
+    enabled: boolean;
+  }>({
+    name: 'Local LM Studio',
+    providerType: 'openai_compatible',
+    apiUrl: 'http://127.0.0.1:1234/v1',
+    model: 'auto',
+    apiKey: '',
+    priority: 5,
+    enabled: true,
+  });
   const [feedback, setFeedback] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -47,30 +72,114 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged })
     }
   };
 
+  const persistProvider = async (p: AiProviderRecord) => {
+    const draftKey = p.providerType === 'gemini' ? undefined : apiKeysDraft[p.id]?.trim() || undefined;
+    await apiRequest(`/api/ai-providers/${p.id}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        name: p.name,
+        providerType: p.providerType,
+        apiUrl: p.apiUrl.trim(),
+        apiKey: draftKey,
+        model: p.model.trim(),
+        contextLimit: p.contextLimit,
+        timeoutMs: p.timeoutMs,
+        priority: p.priority,
+        role: p.role,
+        enabled: p.enabled,
+      }),
+    });
+    if (draftKey) {
+      setApiKeysDraft((prev) => ({ ...prev, [p.id]: '' }));
+    }
+  };
+
   const handleSaveProvider = async (p: AiProviderRecord) => {
     setBusy(true);
     setFeedback(null);
     try {
-      await apiRequest(`/api/ai-providers/${p.id}`, {
-        method: 'PUT',
-        body: JSON.stringify({
-          name: p.name,
-          providerType: p.providerType,
-          apiUrl: p.apiUrl,
-          apiKey: p.providerType === 'gemini' ? undefined : apiKeysDraft[p.id] || undefined,
-          model: p.model,
-          contextLimit: p.contextLimit,
-          timeoutMs: p.timeoutMs,
-          priority: p.priority,
-          role: p.role,
-          enabled: p.enabled,
-        }),
-      });
-      setApiKeysDraft((prev) => ({ ...prev, [p.id]: '' }));
-      await loadAll();
-      setFeedback(`Updated AI provider "${p.name}". Credentials are encrypted at rest and never returned in plaintext.`);
+      await persistProvider(p);
+      const isRealUrl = Boolean(p.apiUrl.trim()) && !p.apiUrl.toLowerCase().includes('.example');
+      if (isRealUrl && p.providerType !== 'gemini') {
+        const res = await apiRequest<{
+          online: boolean;
+          latencyMs: number;
+          availableModels: string[];
+          message: string;
+          errorCode?: AiProviderErrorCode | null;
+        }>(`/api/ai-providers/${p.id}/health`, { method: 'POST' });
+        await loadAll();
+        setFeedback(
+          `Saved "${p.name}" (credentials encrypted at rest). Connectivity check: ${res.online ? 'ONLINE' : 'OFFLINE'}${
+            res.errorCode ? ` [${res.errorCode}]` : ''
+          } (${res.latencyMs}ms) — ${res.message}`,
+        );
+      } else {
+        await loadAll();
+        setFeedback(`Updated AI provider "${p.name}". Credentials are encrypted at rest and never returned in plaintext.`);
+      }
     } catch (err) {
       setFeedback(err instanceof Error ? err.message : 'Provider update failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleAddCustomProvider = async () => {
+    setBusy(true);
+    setFeedback(null);
+    try {
+      const created = await apiRequest<{ provider: AiProviderRecord }>('/api/ai-providers', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: newProvider.name.trim(),
+          providerType: newProvider.providerType,
+          apiUrl: newProvider.apiUrl.trim(),
+          model: newProvider.model.trim() || 'auto',
+          apiKey: newProvider.apiKey.trim() || undefined,
+          priority: newProvider.priority,
+          role: 'fallback',
+          enabled: newProvider.enabled,
+        }),
+      });
+      setShowAddProvider(false);
+      setNewProvider({
+        name: 'Local LM Studio',
+        providerType: 'openai_compatible',
+        apiUrl: 'http://127.0.0.1:1234/v1',
+        model: 'auto',
+        apiKey: '',
+        priority: 5,
+        enabled: true,
+      });
+      const health = await apiRequest<{
+        online: boolean;
+        latencyMs: number;
+        message: string;
+        errorCode?: AiProviderErrorCode | null;
+      }>(`/api/ai-providers/${created.provider.id}/health`, { method: 'POST' });
+      await loadAll();
+      setFeedback(
+        `Added "${created.provider.name}". Connectivity check: ${health.online ? 'ONLINE' : 'OFFLINE'}${
+          health.errorCode ? ` [${health.errorCode}]` : ''
+        } (${health.latencyMs}ms) — ${health.message}`,
+      );
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'Failed to add provider');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDeleteProvider = async (p: AiProviderRecord) => {
+    setBusy(true);
+    setFeedback(null);
+    try {
+      await apiRequest(`/api/ai-providers/${p.id}`, { method: 'DELETE' });
+      await loadAll();
+      setFeedback(`Removed custom AI provider "${p.name}".`);
+    } catch (err) {
+      setFeedback(err instanceof Error ? err.message : 'Failed to delete provider');
     } finally {
       setBusy(false);
     }
@@ -80,13 +189,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged })
     setBusy(true);
     setFeedback(null);
     try {
-      const res = await apiRequest<{ online: boolean; latencyMs: number; availableModels: string[]; message: string }>(
-        `/api/ai-providers/${providerId}/health`,
-        { method: 'POST' },
-      );
+      const target = providers.find((item) => item.id === providerId);
+      if (target) {
+        await persistProvider(target);
+      }
+      const res = await apiRequest<{
+        online: boolean;
+        latencyMs: number;
+        availableModels: string[];
+        message: string;
+        errorCode?: AiProviderErrorCode | null;
+      }>(`/api/ai-providers/${providerId}/health`, { method: 'POST' });
       await loadAll();
       setFeedback(
-        `${providerId}: ${res.online ? 'ONLINE' : 'OFFLINE'} (${res.latencyMs}ms) — ${res.message}${
+        `${providerId}: ${res.online ? 'ONLINE' : 'OFFLINE'}${res.errorCode ? ` [${res.errorCode}]` : ''} (${
+          res.latencyMs
+        }ms) — ${res.message}${
           res.availableModels.length > 0 ? `. Models: ${res.availableModels.slice(0, 6).join(', ')}` : ''
         }`,
       );
@@ -101,12 +219,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged })
     setBusy(true);
     setFeedback(null);
     try {
+      const target = providers.find((item) => item.id === providerId);
+      if (target) {
+        await persistProvider(target);
+      }
       const res = await apiRequest<{ ok: boolean; result: { text: string; model: string; latencyMs: number } }>(
         `/api/ai-providers/${providerId}/test`,
         { method: 'POST', body: JSON.stringify({}) },
       );
+      await loadAll();
       setFeedback(`Model test succeeded (${res.result.model}, ${res.result.latencyMs}ms): "${res.result.text}"`);
     } catch (err) {
+      await loadAll();
       setFeedback(err instanceof Error ? err.message : 'Model test failed');
     } finally {
       setBusy(false);
@@ -192,9 +316,110 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged })
       {/* 1. AI Providers */}
       {tab === 'providers' && (
         <div className="space-y-4">
-          <p className="text-xs text-slate-400">
-            Routing runs strictly in priority order (Priority 1 = Local Ollama first, then enabled fallbacks). Connectivity is verified with real live requests — providers are never assumed online.
-          </p>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-xs text-slate-400">
+              Routing runs strictly in priority order. Supports remote HTTPS endpoints and explicit local loopback servers (<span className="font-mono text-slate-300">localhost</span>, <span className="font-mono text-slate-300">127.0.0.1</span>, <span className="font-mono text-slate-300">[::1]</span>) such as Ollama, FreeLLMAPI (<span className="font-mono text-slate-300">:31415/v1</span>), LM Studio (<span className="font-mono text-slate-300">:1234/v1</span>), and local vLLM (<span className="font-mono text-slate-300">:8000/v1</span>). Private LAN and cloud metadata addresses remain blocked.
+            </p>
+            <button
+              onClick={() => setShowAddProvider((v) => !v)}
+              disabled={busy}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg border border-cyan-500/40 text-cyan-300 hover:bg-cyan-500/10 whitespace-nowrap"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              <span>Add Other Provider</span>
+            </button>
+          </div>
+
+          {showAddProvider && (
+            <div className="bg-[#0B1221] border border-cyan-500/40 rounded-xl p-5 space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-semibold text-white">Add Custom / Local AI Provider (Other Providers)</h2>
+                <button
+                  onClick={() => setShowAddProvider(false)}
+                  className="text-xs text-slate-400 hover:text-white"
+                >
+                  Cancel
+                </button>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
+                <div>
+                  <label className="block text-slate-400 mb-1">Provider Name</label>
+                  <input
+                    value={newProvider.name}
+                    onChange={(e) => setNewProvider({ ...newProvider, name: e.target.value })}
+                    placeholder="e.g. Local LM Studio or Local vLLM"
+                    className="w-full bg-[#060A14] border border-slate-700 rounded-lg px-3 py-2 text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1">Provider Type</label>
+                  <select
+                    value={newProvider.providerType}
+                    onChange={(e) =>
+                      setNewProvider({
+                        ...newProvider,
+                        providerType: e.target.value as Exclude<AiProviderType, 'gemini'>,
+                      })
+                    }
+                    className="w-full bg-[#060A14] border border-slate-700 rounded-lg px-3 py-2 text-white"
+                  >
+                    <option value="openai_compatible">OpenAI-Compatible (LM Studio, vLLM, etc.)</option>
+                    <option value="freellmapi">FreeLLMAPI</option>
+                    <option value="ollama">Ollama</option>
+                  </select>
+                </div>
+                <div className="md:col-span-2">
+                  <label className="block text-slate-400 mb-1">Endpoint URL</label>
+                  <input
+                    value={newProvider.apiUrl}
+                    onChange={(e) => setNewProvider({ ...newProvider, apiUrl: e.target.value })}
+                    placeholder="http://127.0.0.1:1234/v1 or https://api.example.com/v1"
+                    className="w-full bg-[#060A14] border border-slate-700 rounded-lg px-3 py-2 font-mono text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block text-slate-400 mb-1">Model Name (supports "auto")</label>
+                  <input
+                    value={newProvider.model}
+                    onChange={(e) => setNewProvider({ ...newProvider, model: e.target.value })}
+                    placeholder="auto"
+                    className="w-full bg-[#060A14] border border-slate-700 rounded-lg px-3 py-2 font-mono text-white"
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <label className="block text-slate-400 mb-1">Optional API Key / Token</label>
+                  <input
+                    type="password"
+                    value={newProvider.apiKey}
+                    onChange={(e) => setNewProvider({ ...newProvider, apiKey: e.target.value })}
+                    placeholder="Optional for local servers; encrypted at rest"
+                    className="w-full bg-[#060A14] border border-slate-700 rounded-lg px-3 py-2 text-white"
+                  />
+                </div>
+                <div className="flex items-end justify-between gap-2">
+                  <div className="w-24">
+                    <label className="block text-slate-400 mb-1">Priority</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={newProvider.priority}
+                      onChange={(e) => setNewProvider({ ...newProvider, priority: Number(e.target.value) })}
+                      className="w-full bg-[#060A14] border border-slate-700 rounded-lg px-3 py-2 font-mono text-white"
+                    />
+                  </div>
+                  <button
+                    onClick={handleAddCustomProvider}
+                    disabled={busy || !newProvider.name.trim() || !newProvider.apiUrl.trim()}
+                    className="px-4 py-2 text-xs font-semibold rounded-lg bg-cyan-500 text-slate-950 hover:bg-cyan-400 disabled:opacity-40 whitespace-nowrap"
+                  >
+                    Create & Check
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {providers.map((p, idx) => (
             <div key={p.id} className="bg-[#0B1221] border border-slate-800/90 rounded-xl p-5 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
@@ -213,6 +438,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged })
                     >
                       {p.lastStatus}
                     </span>
+                    {p.lastErrorCode ? ` [${p.lastErrorCode}]` : ''}
                     {p.lastCheckedAt ? ` · Checked ${formatShortDate(p.lastCheckedAt)}` : ''}
                   </p>
                   {p.lastError && <p className="text-xs text-rose-400 mt-1">{p.lastError}</p>}
@@ -241,7 +467,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged })
                   </button>
                   <button
                     onClick={() => handleTestCompletion(p.id)}
-                    disabled={busy || !p.enabled}
+                    disabled={busy}
                     className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs border border-slate-700 rounded-lg text-cyan-300 hover:border-cyan-400/50 disabled:opacity-40"
                   >
                     <Zap className="w-3.5 h-3.5" />
@@ -254,6 +480,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged })
                   >
                     Save
                   </button>
+                  {!BUILTIN_PROVIDER_IDS.has(p.id) && (
+                    <button
+                      onClick={() => handleDeleteProvider(p)}
+                      disabled={busy}
+                      title="Remove custom provider"
+                      className="inline-flex items-center gap-1 px-2 py-1.5 text-xs border border-rose-800/70 rounded-lg text-rose-300 hover:bg-rose-500/10"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                 </div>
               </div>
 
@@ -263,6 +499,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged })
                   <input
                     value={p.apiUrl}
                     disabled={p.providerType === 'gemini'}
+                    placeholder={
+                      p.providerType === 'freellmapi'
+                        ? 'http://127.0.0.1:31415/v1 or https://apifreellm.com/api/v1/chat'
+                        : p.providerType === 'openai_compatible'
+                          ? 'http://127.0.0.1:1234/v1 or http://127.0.0.1:8000/v1'
+                          : 'http://127.0.0.1:11434'
+                    }
                     onChange={(e) => {
                       const copy = [...providers];
                       copy[idx] = { ...p, apiUrl: e.target.value };
@@ -275,6 +518,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged })
                   <label className="block text-slate-400 mb-1">Model Name</label>
                   <input
                     value={p.model}
+                    placeholder="auto"
                     onChange={(e) => {
                       const copy = [...providers];
                       copy[idx] = { ...p, model: e.target.value };
@@ -629,15 +873,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onSettingsChanged })
               This full-stack application runs natively outside any sandbox using PowerShell scripts in <span className="font-mono text-slate-200">scripts/</span>:
             </p>
             <pre className="bg-[#060A14] border border-slate-800 rounded-lg p-3.5 text-xs font-mono text-cyan-200 overflow-x-auto">
-{`# Windows 10/11 PowerShell
-.\\scripts\\install.ps1
-.\\scripts\\start.ps1
-.\\scripts\\check-health.ps1
-.\\scripts\\backup.ps1
-.\\scripts\\stop.ps1
+{`# Windows 10/11 (recommended .cmd wrappers — no script-signing errors)
+.\\scripts\\install.cmd
+.\\scripts\\start.cmd
+.\\scripts\\check-health.cmd
+.\\scripts\\backup.cmd
+.\\scripts\\stop.cmd
 
-# Linux / Cloud Node.js 22+
-npm install && npm run build
+# Linux / Cloud Node.js 22.13+
+npm ci && npm run build
 NODE_ENV=production PORT=3000 npm start`}
             </pre>
           </div>
