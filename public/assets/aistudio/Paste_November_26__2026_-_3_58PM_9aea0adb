@@ -1,0 +1,1450 @@
+# PROJECT: FREELANCE AI AGENT HUB
+
+Build a complete, production-oriented, local-first AI freelance job discovery and work execution application for Windows.
+
+The application must be a functioning full-stack system, not a static UI prototype. It should have a futuristic dashboard, a backend, database, AI agent orchestration, local model support, job discovery connectors, project workspaces, file generation, quality control, automation and a final submission center.
+
+The system is designed to find freelance opportunities across multiple permitted job sources, analyze opportunities, generate proposals, perform approved work through local AI agents, verify deliverables and prepare completed projects for me to manually submit to clients.
+
+I want to spend as little time as possible doing the actual work. AI agents should handle the research, planning, writing, coding, document creation, data processing, testing and packaging whenever technically possible.
+
+I do NOT want graphic design jobs.
+
+The system must prioritize local AI models and support external AI providers as optional fallbacks.
+
+---
+
+# 1. APPLICATION GOALS
+
+Build an application that:
+
+1. Searches configured freelance and remote earning platforms.
+2. Discovers new job opportunities.
+3. Imports and stores job listings.
+4. Removes duplicate listings.
+5. Automatically analyzes job requirements.
+6. Filters jobs by my skills, preferences, budget and available resources.
+7. Excludes graphic design jobs.
+8. Detects scams and suspicious job listings.
+9. Estimates work difficulty, time and potential earnings.
+10. Ranks suitable jobs.
+11. Generates personalized proposals.
+12. Creates project plans.
+13. Performs accepted freelance work through AI agents.
+14. Creates real downloadable files and deliverables.
+15. Uses an independent AI agent to check deliverables.
+16. Automatically corrects errors within bounded limits.
+17. Packages completed deliverables.
+18. Generates a submission message.
+19. Allows me to manually submit completed work to clients.
+20. Tracks project progress and earnings.
+21. Runs scheduled background tasks.
+22. Runs locally on Windows.
+23. Supports local AI through Ollama.
+24. Supports optional API providers and fallback models.
+25. Uses a resource-aware agent scheduler.
+26. Protects my PC, files, accounts and credentials.
+
+The application must not falsely claim that jobs were found, proposals were sent, work was completed, files were created or earnings were generated unless these actions were actually verified.
+
+---
+
+# 2. TECHNICAL STACK
+
+Use the following stack where compatible.
+
+Frontend:
+- React
+- TypeScript
+- Vite
+- Tailwind CSS
+- Modern component architecture
+- Lucide icons
+- Recharts for analytics
+
+Backend:
+- Node.js
+- TypeScript
+- Express or an equivalent lightweight framework
+- REST API
+- SQLite
+
+AI:
+- Ollama for local AI models
+- OpenAI-compatible provider abstraction
+- Configurable external API providers
+- FreeLLMAPI support through configurable endpoint and credentials
+- Local-first routing
+
+Automation:
+- Persistent task queue
+- Scheduled jobs
+- Playwright for permitted browser automation
+- Connector abstraction for individual job platforms
+- Browser session management
+
+File processing:
+- Python utilities where needed
+- Node.js file processing
+- DOCX creation
+- XLSX creation
+- PDF creation
+- PPTX creation
+- ZIP packaging
+
+Security:
+- Local authentication
+- Workspace isolation
+- Tool permissions
+- Restricted execution
+- Audit logs
+- Secret management
+
+Deployment:
+- Windows 10/11 compatibility
+- Local server
+- Startup scripts
+- Clear installation instructions
+- Optional future desktop packaging
+
+Do not introduce unnecessary heavy dependencies.
+
+---
+
+# 3. UI DESIGN
+
+Create a premium futuristic AI command-center interface.
+
+Design style:
+
+- Dark background
+- Deep navy surfaces
+- Blue and cyan accents
+- Subtle glowing borders
+- Modern cards
+- Responsive layout
+- Smooth transitions
+- Professional typography
+- Compact but readable information
+- Modern charts
+- Agent status indicators
+- Task activity timeline
+- File previews
+- Clear navigation
+
+Do not make it look like a generic template.
+
+The interface should feel like a futuristic AI operations center.
+
+Main navigation:
+
+1. Dashboard
+2. Job Discovery
+3. Job Details
+4. Proposal Studio
+5. AI Agent Center
+6. Project Workspace
+7. Quality Control
+8. Submission Center
+9. Earnings & Analytics
+10. Task History
+11. Job Sources
+12. Settings
+
+Create a responsive desktop-first interface with a usable mobile layout.
+
+---
+
+# 4. DASHBOARD
+
+Build a comprehensive dashboard.
+
+Display:
+
+- Total jobs discovered
+- New jobs
+- Suitable jobs
+- High-match jobs
+- Jobs awaiting approval
+- Active projects
+- Agents running
+- Agents queued
+- Tasks completed
+- Tasks failed
+- Jobs ready for submission
+- Earnings recorded
+- Estimated potential earnings
+- Actual paid earnings
+
+Create charts for:
+
+- Job discovery over time
+- Jobs by platform
+- Jobs by category
+- Job match scores
+- Project status
+- Earnings history
+- Agent performance
+
+Create an activity feed that displays:
+
+- Job discovery
+- Job analysis
+- Proposal creation
+- Approval events
+- Project execution
+- QA
+- Deliverable generation
+- Errors
+- Notifications
+
+All dashboard data must be connected to the backend and database.
+
+Do not hardcode fake production statistics.
+
+Use demo data only in a clearly identified demo mode.
+
+---
+
+# 5. JOB SOURCE SYSTEM
+
+Create an extensible job source connector architecture.
+
+The system should support sources such as:
+
+- Upwork
+- Freelancer.com
+- Fiverr
+- PeoplePerHour
+- Guru
+- Remote job boards
+- Wellfound
+- Other permitted freelance or earning websites
+
+Do not assume every website allows automated scraping or browser automation.
+
+Each source must have a connector interface.
+
+Connector capabilities should include:
+
+- Search
+- Job retrieval
+- Job import
+- Job normalization
+- Job deduplication
+- Job details retrieval
+- Source status
+- Connection status
+- Error reporting
+- Rate limit configuration
+- Connector-specific permission settings
+
+Use official APIs, permitted public feeds, approved integrations or user-authorized workflows.
+
+If a source prohibits automation or access, do not circumvent its restrictions.
+
+Allow manual job URL import.
+
+Allow manual job description import.
+
+Allow importing jobs from CSV or JSON files.
+
+Allow a connector to be disabled independently.
+
+Create a source management page.
+
+Display:
+
+- Source name
+- Connection status
+- Last successful search
+- Last error
+- Jobs discovered
+- Jobs imported
+- Enabled or disabled
+- Supported capabilities
+- Search frequency
+
+---
+
+# 6. JOB DATABASE
+
+Create a proper database schema.
+
+Jobs should contain:
+
+- ID
+- Source
+- Source job ID
+- Job URL
+- Title
+- Description
+- Client information when available
+- Budget
+- Currency
+- Payment type
+- Posted date
+- Deadline
+- Skills
+- Category
+- Estimated work hours
+- Job score
+- Risk score
+- Match score
+- Status
+- Date discovered
+- Date imported
+- Date analyzed
+- Date updated
+- Job rejection reason
+
+Create duplicate detection using:
+
+- Source ID
+- Source job ID
+- URL
+- Normalized title
+- Description similarity where appropriate
+
+Never overwrite valuable user-edited data without preserving it.
+
+---
+
+# 7. JOB DISCOVERY AGENT
+
+Create a specialized Job Scout agent.
+
+Its responsibilities:
+
+- Search configured job sources.
+- Retrieve permitted listings.
+- Normalize listings.
+- Detect duplicates.
+- Store jobs.
+- Trigger job analysis.
+- Detect expired listings.
+- Track search history.
+- Respect rate limits.
+- Respect connector permissions.
+- Report errors.
+
+Use persistent scheduled tasks.
+
+Allow the user to configure search frequency.
+
+Allow pausing and resuming discovery.
+
+Allow manual search.
+
+Allow searches across multiple enabled sources.
+
+Do not create infinite polling loops.
+
+Implement bounded retries and exponential backoff.
+
+---
+
+# 8. JOB ANALYSIS AGENT
+
+Create a specialized Job Analyst agent.
+
+Analyze:
+
+- Required skills
+- Required deliverables
+- Deadline
+- Budget
+- Estimated hours
+- Difficulty
+- Client credibility
+- Risk
+- Competition where available
+- Expected profit
+- Feasibility
+- Tools needed
+- Missing capabilities
+- Potential scam indicators
+
+Calculate a configurable job score out of 100.
+
+Initial scoring:
+
+- Skill compatibility: 30 points
+- Budget: 20 points
+- Time required: 15 points
+- Deadline feasibility: 10 points
+- Client credibility: 10 points
+- Competition: 10 points
+- Risk: 5 points
+
+Allow the weights to be adjusted in Settings.
+
+Display the reasoning behind every score.
+
+Do not fabricate client history or competition statistics.
+
+---
+
+# 9. JOB FILTERING
+
+Create configurable filters.
+
+Include:
+
+- Minimum budget
+- Maximum working hours
+- Minimum match score
+- Preferred categories
+- Preferred platforms
+- Preferred currencies
+- Preferred payment type
+- Preferred deadlines
+- Excluded keywords
+- Included keywords
+- Scam risk threshold
+- Maximum complexity
+- Required skills
+- Excluded skills
+- Excluded job types
+
+Exclude graphic design jobs.
+
+Reject jobs where graphic design is the primary deliverable.
+
+If a job is unsuitable, explain why.
+
+Allow manually overriding the rejection for a job, but maintain the exclusion policy as the default.
+
+Categories to support:
+
+- Virtual assistance
+- Data entry
+- Data processing
+- Data cleaning
+- Internet research
+- Lead generation
+- Customer support
+- Email support
+- Live chat support
+- Writing
+- Content writing
+- Proofreading
+- SEO
+- Programming
+- Web development
+- Testing
+- Automation
+- Excel
+- Spreadsheet work
+- Word documents
+- PowerPoint
+- Business research
+- Ecommerce
+- Product listing
+- Transcription
+- Translation
+- Technical documentation
+- WordPress
+- Marketing
+- Administrative tasks
+- Other feasible work
+
+Do not claim professional credentials I do not have.
+
+---
+
+# 10. PROPOSAL AGENT
+
+Create a specialized Proposal Writer agent.
+
+For each selected job:
+
+1. Analyze the job description.
+2. Identify the client's requirements.
+3. Identify required deliverables.
+4. Identify likely client concerns.
+5. Generate a tailored proposal.
+6. Generate a short introduction.
+7. Generate a project approach.
+8. Generate a timeline.
+9. Generate questions for the client where necessary.
+10. Suggest a realistic bid.
+11. Explain pricing.
+12. Save the proposal.
+13. Allow editing.
+14. Store proposal history.
+
+Proposal quality should prioritize:
+
+- Relevance
+- Clarity
+- Professionalism
+- Specificity
+- Honest experience
+- Realistic claims
+- Understanding of the project
+- Clear approach
+- Concise communication
+
+Do not invent experience, qualifications, completed projects, testimonials or certifications.
+
+Proposal generation must be available in the Proposal Studio.
+
+The proposal must not be automatically submitted.
+
+---
+
+# 11. AGENT ORCHESTRATION
+
+Create a multi-agent orchestration system.
+
+Agents:
+
+1. Job Scout
+2. Job Analyst
+3. Proposal Writer
+4. Research Agent
+5. Work Planner
+6. Execution Agent
+7. Coding Agent
+8. Document Agent
+9. Data Agent
+10. QA Agent
+11. Correction Agent
+12. Delivery Agent
+13. Security Agent
+
+Agents should be specialized but share a common task engine.
+
+Implement:
+
+- Task planning
+- Task execution
+- Task dependencies
+- Agent assignment
+- Shared model pool
+- Tool registry
+- Task queue
+- Task priority
+- Retry policies
+- Cancellation
+- Timeout
+- Progress reporting
+- Persistent task state
+- Task recovery after restart
+- Resource monitoring
+- Logging
+
+Do not launch every agent simultaneously.
+
+Use a resource-aware scheduler.
+
+Agents should be able to work sequentially when resources are limited.
+
+Concurrency must be adjustable.
+
+---
+
+# 12. LOCAL AI AND MODEL ROUTING
+
+Create an AI provider manager.
+
+Primary preference:
+
+- Local Ollama models
+
+Fallback options:
+
+- FreeLLMAPI
+- OpenAI-compatible API providers
+- Configurable external models
+
+Allow users to configure:
+
+- Provider
+- API URL
+- API key
+- Model
+- Context limit
+- Timeout
+- Priority
+- Role
+- Availability
+
+Create a model health check.
+
+Create a model test function.
+
+Create a provider status page.
+
+Implement fallback routing.
+
+When the local model fails, use an enabled fallback provider.
+
+When a fallback fails, retry only within bounded limits.
+
+Do not expose API keys in the UI, logs or database in plaintext.
+
+Do not assume a provider is available.
+
+Use actual connectivity checks.
+
+---
+
+# 13. RESOURCE-AWARE SCHEDULER
+
+The system must work on modest Windows PCs.
+
+Monitor:
+
+- RAM
+- CPU
+- GPU when available
+- Disk space
+- Active model
+- Model loading status
+- Running tasks
+
+Use conservative defaults.
+
+The system must not load many models simultaneously.
+
+Allow users to configure:
+
+- Maximum concurrent agents
+- Maximum memory usage
+- CPU task limits
+- GPU preference
+- Task priority
+- Queue limits
+- Model loading strategy
+
+When system resources are low:
+
+- Pause low-priority tasks.
+- Reduce concurrency.
+- Avoid loading additional models.
+- Queue tasks.
+- Notify the user.
+
+Provide a scheduler status panel.
+
+---
+
+# 14. WORK EXECUTION ENGINE
+
+Create a project workspace for each approved freelance job.
+
+The execution system should:
+
+1. Read the job requirements.
+2. Create a project plan.
+3. Break the work into subtasks.
+4. Assign subtasks to agents.
+5. Select tools.
+6. Execute tasks.
+7. Produce actual files.
+8. Save intermediate results.
+9. Verify files.
+10. Run QA.
+11. Correct errors.
+12. Package the deliverables.
+
+Supported deliverables:
+
+- DOCX
+- XLSX
+- CSV
+- PDF
+- PPTX
+- TXT
+- Markdown
+- HTML
+- ZIP
+- Code projects
+- Websites
+- Scripts
+- Reports
+- Research documents
+
+Create tools for:
+
+- Research
+- File creation
+- Document formatting
+- Spreadsheet analysis
+- Spreadsheet creation
+- Code generation
+- Code testing
+- Website generation
+- HTML generation
+- Data cleaning
+- Data processing
+- PDF generation
+- Document conversion
+- ZIP packaging
+
+Deliverables must be actual files saved in the project's workspace.
+
+Do not merely return a description of a file.
+
+---
+
+# 15. PROJECT WORKSPACE
+
+Each project must have its own isolated directory.
+
+Suggested structure:
+
+FreelanceAgentHub/
+    projects/
+        project_id/
+            requirements/
+            research/
+            source_data/
+            working_files/
+            deliverables/
+            tests/
+            reports/
+            logs/
+            project_plan.md
+            qa_report.md
+            submission_message.md
+
+Create a workspace interface.
+
+Show:
+
+- Project status
+- Job description
+- Requirements
+- Project plan
+- Tasks
+- Agents
+- Files
+- Progress
+- QA results
+- Errors
+- Timeline
+
+Allow file previews.
+
+Allow downloads.
+
+Allow ZIP packaging.
+
+Do not permit unrestricted filesystem access.
+
+Workspace boundaries must be enforced.
+
+---
+
+# 16. EXECUTION TOOLS AND SANDBOX
+
+Agents must use restricted tools.
+
+Do not allow unrestricted command execution.
+
+Implement a tool permission system.
+
+Tools must declare:
+
+- Tool name
+- Purpose
+- Permissions
+- Input schema
+- Output schema
+- Timeout
+- Resource limit
+- Risk level
+
+Allow only explicitly authorized tools.
+
+Use a restricted execution environment for code execution.
+
+Limit filesystem access to the project workspace and specifically authorized locations.
+
+Require approval before installing software or executing high-risk actions.
+
+Restrict network access where practical.
+
+Do not execute client-provided executables.
+
+Do not execute arbitrary downloaded scripts.
+
+---
+
+# 17. BROWSER AUTOMATION
+
+Create a restricted browser automation subsystem.
+
+Use Playwright only for permitted workflows.
+
+Support:
+
+- Browser session management
+- Navigation
+- Page inspection
+- Screenshot capture
+- Permitted public page research
+- User-authorized workflows
+- Browser status
+- Browser task logs
+
+Do not bypass CAPTCHA systems.
+
+Do not bypass anti-bot protections.
+
+Do not evade rate limits.
+
+Do not bypass authentication controls.
+
+Do not use fingerprint spoofing or stealth mechanisms to evade platform detection.
+
+When a CAPTCHA or human verification appears:
+
+1. Detect the verification state when possible.
+2. Pause the task.
+3. Notify the user.
+4. Keep the browser session available if permitted.
+5. Allow manual verification.
+6. Resume only when the permitted workflow can continue.
+
+Do not integrate AI CAPTCHA bypass tools into the job platform automation loop.
+
+Browser automation must be disabled by default for sources where it is prohibited.
+
+Each connector must have its own permission policy.
+
+---
+
+# 18. JOB SOURCE CONNECTOR FRAMEWORK
+
+Create an independent connector architecture.
+
+Each connector must implement:
+
+- Initialization
+- Health check
+- Search
+- Job retrieval
+- Job normalization
+- Job import
+- Deduplication
+- Rate limit management
+- Error handling
+- Permission configuration
+- Enable / disable
+- Status reporting
+
+Create a generic connector interface.
+
+Initially implement:
+
+- Manual job import
+- CSV import
+- JSON import
+- Public permitted job feeds
+- Connector scaffolding for freelance platforms
+
+Do not claim that a connector is functional when it is only a placeholder.
+
+Clearly label unimplemented connectors.
+
+Do not fabricate data.
+
+---
+
+# 19. QUALITY CONTROL AGENT
+
+Create an independent QA agent.
+
+The QA agent should evaluate the deliverables against the job requirements.
+
+Checklist:
+
+- Requirements satisfied
+- Correct output format
+- Correct file names
+- Files exist
+- Files open
+- No placeholder text
+- No missing sections
+- Content accuracy
+- Formatting quality
+- Data accuracy
+- Calculations verified
+- Citations verified where applicable
+- Code tested
+- No unnecessary files
+- Deliverables organized
+- No fabricated facts
+
+Create a QA score.
+
+Initial score thresholds:
+
+- 90 to 100: Ready for review
+- 75 to 89: Needs review
+- Below 75: Needs correction
+
+These scores must not be represented as guarantees.
+
+If QA fails:
+
+1. Identify errors.
+2. Create correction tasks.
+3. Send corrections to the appropriate agent.
+4. Retry within a configurable limit.
+5. Run QA again.
+6. Stop after the retry limit.
+7. Report unresolved issues.
+
+Do not create infinite correction loops.
+
+---
+
+# 20. SUBMISSION CENTER
+
+Create a dedicated Submission Center.
+
+Display projects that have completed execution and QA.
+
+Each card should include:
+
+- Job title
+- Platform
+- Client information where available
+- Original job URL
+- Budget
+- Estimated earnings
+- Project status
+- QA score
+- Completion date
+- Deliverables
+- Submission message
+
+Allow:
+
+- Download individual files
+- Download ZIP
+- Preview files
+- Review QA
+- Review submission message
+- Open original job link
+- Mark submitted
+- Record submission date
+- Mark paid
+- Record payment amount
+- Record payment currency
+- Record fees
+- Record notes
+
+The system must not automatically submit proposals or deliver work.
+
+I will submit completed work myself.
+
+---
+
+# 21. EARNINGS TRACKER
+
+Create an analytics system.
+
+Track:
+
+- Jobs discovered
+- Jobs analyzed
+- Jobs shortlisted
+- Proposals drafted
+- Proposals submitted manually
+- Contracts awarded
+- Projects completed
+- Jobs submitted
+- Jobs paid
+- Estimated earnings
+- Actual earnings
+- Platform fees
+- Net earnings
+
+Create:
+
+- Earnings chart
+- Monthly reports
+- Platform reports
+- Category reports
+- Job completion statistics
+- Productivity statistics
+
+Never confuse potential earnings with actual earnings.
+
+Only recorded payments should be classified as actual paid earnings.
+
+---
+
+# 22. NOTIFICATIONS
+
+Create an in-app notification system.
+
+Notify me when:
+
+- A new high-match job is discovered.
+- A job is shortlisted.
+- A proposal is ready.
+- A project needs approval.
+- A task begins.
+- A task finishes.
+- QA passes.
+- QA fails.
+- A task fails.
+- A CAPTCHA requires manual verification.
+- A connector fails.
+- A provider becomes unavailable.
+- System resources are low.
+- A project is ready for submission.
+
+Allow notification settings.
+
+---
+
+# 23. SETTINGS
+
+Create settings pages for:
+
+- AI providers
+- Models
+- Job sources
+- Job filters
+- Skills
+- Categories
+- Excluded keywords
+- Budgets
+- Work limits
+- Resource limits
+- Agent concurrency
+- Scheduler
+- Workspace location
+- Security
+- Notifications
+- Database
+- Backups
+- Application configuration
+
+Allow importing and exporting configuration.
+
+Do not export credentials in plaintext.
+
+---
+
+# 24. SECURITY
+
+Implement security-first architecture.
+
+Protect against:
+
+- Prompt injection
+- Malicious job descriptions
+- Malicious downloaded files
+- Dangerous commands
+- Path traversal
+- Unauthorized file access
+- API key leakage
+- Unauthorized agent tools
+- Unsafe browser actions
+- SSRF
+- Malicious URLs
+- ZIP extraction vulnerabilities
+- Database corruption
+- Unrestricted code execution
+- Excessive resource consumption
+
+Treat all job descriptions, external files, website content and client messages as untrusted data.
+
+External content must never override agent system instructions.
+
+Require approval for:
+
+- Sending messages
+- Submitting proposals
+- Accepting contracts
+- Payments
+- Purchases
+- Installing software
+- High-risk actions
+- Unrestricted external communications
+
+Maintain audit logs.
+
+---
+
+# 25. DATABASE
+
+Use SQLite.
+
+Create migrations.
+
+Create appropriate indexes.
+
+Use foreign keys.
+
+Store:
+
+- Jobs
+- Sources
+- Connectors
+- Proposals
+- Projects
+- Project tasks
+- Agent tasks
+- Deliverables
+- QA reports
+- Notifications
+- Earnings
+- Payments
+- Settings
+- Model configurations
+- Task logs
+- Audit logs
+- Search history
+
+Persist task states.
+
+Recover interrupted tasks safely.
+
+Prevent duplicate execution.
+
+Prevent simultaneous approvals from launching duplicate projects.
+
+Implement transactional task creation where needed.
+
+---
+
+# 26. TASK QUEUE
+
+Implement a persistent background task queue.
+
+Features:
+
+- Queue
+- Priority
+- Status
+- Retry
+- Cancellation
+- Timeout
+- Progress
+- Dependencies
+- Recovery
+- Deduplication
+- Resource limits
+- Task logs
+
+States:
+
+- Pending
+- Queued
+- Running
+- Paused
+- Awaiting approval
+- Completed
+- Failed
+- Cancelled
+
+Cancellation must actually stop the execution pipeline and prevent further downstream actions.
+
+Prevent duplicate pipelines.
+
+Recover interrupted tasks after restart.
+
+Use bounded retries.
+
+Do not retry indefinitely.
+
+---
+
+# 27. APPLICATION API
+
+Create backend API routes for:
+
+- Health
+- Dashboard
+- Jobs
+- Job search
+- Job import
+- Job analysis
+- Job filters
+- Sources
+- Connectors
+- Proposals
+- Agents
+- Tasks
+- Task cancellation
+- Task pause
+- Task resume
+- Projects
+- Project files
+- Deliverables
+- QA
+- Submission center
+- Earnings
+- Analytics
+- Notifications
+- Settings
+- AI providers
+- Models
+- Resource monitoring
+- Audit logs
+
+Validate all inputs.
+
+Use structured errors.
+
+Do not expose stack traces or secrets to the UI.
+
+---
+
+# 28. AUTOMATION
+
+Implement scheduled job discovery.
+
+Allow the user to set:
+
+- Search frequency
+- Enabled sources
+- Maximum jobs per search
+- Minimum score
+- Maximum active projects
+- Resource limits
+
+Implement:
+
+- Scheduler
+- Persistent queue
+- Task recovery
+- Duplicate prevention
+- Search history
+- Notifications
+
+Do not run uncontrolled loops.
+
+Do not exceed configured source rate limits.
+
+---
+
+# 29. WINDOWS LOCAL DEPLOYMENT
+
+Create a complete Windows setup.
+
+Include:
+
+- Installation instructions
+- Requirements
+- Setup scripts
+- Start scripts
+- Stop scripts
+- Health checks
+- Database initialization
+- Configuration
+- Troubleshooting
+- Backup and restore
+
+Create PowerShell scripts:
+
+install.ps1
+start.ps1
+stop.ps1
+check-health.ps1
+backup.ps1
+
+The application must not depend on manually starting multiple complicated services.
+
+Create a unified startup process.
+
+If Ollama is installed, detect it.
+
+If Ollama is not installed, display installation instructions without silently installing software.
+
+Detect missing dependencies.
+
+Do not require Docker for the initial version.
+
+---
+
+# 30. TESTING
+
+Create a test suite.
+
+Test:
+
+- Application startup
+- Database
+- API
+- Job import
+- Job deduplication
+- Job scoring
+- Job filtering
+- Graphic design exclusion
+- Proposal generation
+- Model connection
+- API fallback
+- Task creation
+- Task cancellation
+- Duplicate prevention
+- Queue recovery
+- Agent orchestration
+- Workspace isolation
+- File generation
+- File validation
+- ZIP creation
+- QA
+- Correction loop
+- Resource scheduling
+- Security
+- Connector failures
+
+Create integration tests.
+
+Create unit tests.
+
+Create a test report.
+
+Do not claim that tests passed unless they were actually executed.
+
+---
+
+# 31. DEVELOPMENT STRATEGY
+
+Build the application in phases.
+
+Phase 1:
+- Frontend
+- Dashboard
+- Navigation
+- Backend
+- SQLite
+- Settings
+- Application shell
+
+Phase 2:
+- Job discovery architecture
+- Import
+- Source management
+- Database
+
+Phase 3:
+- Job analysis
+- Filtering
+- Scoring
+
+Phase 4:
+- Proposal Studio
+
+Phase 5:
+- Local AI integration
+- Model routing
+- Agent orchestration
+
+Phase 6:
+- Work execution
+- Workspace
+- Deliverables
+
+Phase 7:
+- QA
+- Correction loop
+
+Phase 8:
+- Submission Center
+- Earnings
+
+Phase 9:
+- Scheduling
+- Background automation
+
+Phase 10:
+- Security
+- Testing
+- Windows deployment
+
+Do not leave phases as fake implementations.
+
+Do not create buttons that do nothing.
+
+Do not simulate functionality with fake data in production mode.
+
+Do not mark a feature complete unless it works.
+
+---
+
+# 32. IMPLEMENTATION REQUIREMENTS
+
+Begin by creating the project structure and implementing the application.
+
+Do not merely provide a plan.
+
+Build the frontend and backend.
+
+Create the database.
+
+Create the APIs.
+
+Create the UI.
+
+Create the local AI integration architecture.
+
+Create the job source framework.
+
+Create the agent framework.
+
+Create the task queue.
+
+Create the workspace.
+
+Create the QA system.
+
+Create the submission center.
+
+Create the settings.
+
+Create the installation scripts.
+
+Create the tests.
+
+When you cannot implement a connector due to external API restrictions, clearly explain the limitation and implement the connector interface and manual import alternative.
+
+Do not invent credentials.
+
+Do not invent APIs.
+
+Do not invent jobs.
+
+Do not invent earnings.
+
+Do not invent successful execution.
+
+Do not use fake production statistics.
+
+Use demo data only when demo mode is clearly enabled.
+
+Prioritize a working end-to-end application over a beautiful but nonfunctional mockup.
+
+The final application must allow me to:
+
+1. Start the application on Windows.
+2. Connect local AI models.
+3. Configure job sources.
+4. Discover or import freelance jobs.
+5. Analyze jobs.
+6. Filter jobs.
+7. Generate proposals.
+8. Approve a project.
+9. Execute project work using AI agents.
+10. Create actual deliverable files.
+11. Run QA.
+12. Correct errors.
+13. Package deliverables.
+14. Review the submission message.
+15. Submit the work manually.
+16. Track earnings.
+
+Build the application with a maintainable architecture, robust error handling, persistent storage, safe agent execution, resource-aware scheduling and a futuristic AI command-center interface.
+
+Start implementation now.
